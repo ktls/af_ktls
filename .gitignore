@@ -1,0 +1,10 @@
+.af_ktls.ko.cmd
+.af_ktls.mod.o.cmd
+.af_ktls.o.cmd
+.tmp_versions/
+Module.symvers
+af_ktls.ko
+af_ktls.mod.c
+af_ktls.mod.o
+af_ktls.o
+modules.order
