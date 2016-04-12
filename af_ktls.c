@@ -395,14 +395,13 @@ static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
  */
 static inline int dtls_window(struct tls_sock *tsk, const char * sn)
 {
-	uint64_t *seq_num_ptr, *seq_num_last_ptr;
 	uint64_t seq_num, seq_num_last;
 
-	seq_num_ptr = (uint64_t *) sn;
-	seq_num_last_ptr = (uint64_t *) tsk->iv_recv;
-	
-	seq_num = be64_to_cpu(*seq_num_ptr);
-	seq_num_last = be64_to_cpu(*seq_num_last_ptr);
+	memcpy(&seq_num, sn, sizeof(seq_num));
+	memcpy(&seq_num_last, tsk->iv_recv, sizeof(seq_num_last));
+
+	seq_num = be64_to_cpu(seq_num);
+	seq_num_last = be64_to_cpu(seq_num_last);
 
 	if (!DTLS_SAME_EPOCH(seq_num_last, seq_num))
 		return -1;
