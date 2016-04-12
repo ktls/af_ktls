@@ -18,11 +18,11 @@ Linux crypto mailing list by Dave Watson from Facebook. Changes made by this
 patch were not merged, so you need to apply this patch in order to test
 ```AF_KTLS``` socket implementation. If you want to look at benchmarking
 scenarios or test your use case speed impact, visit [AF_KTLS
-tool](https://github.com/fridex/af-ktls-tool).
+tool](https://github.com/fridex/af_ktls-tool).
 
-See [issues](http://github.com/fridex/af-ktls/issues) issues for awaiting
+See [issues](http://github.com/fridex/af_ktls/issues) for awaiting
 enhancements or bugs.
 
-See also [AF_KTLS tool](https://github.com/fridez/af-ktls-tool), [AF_KTLS
-visualize](https://github.com/fridex/af-ktls-visualize).
+See also [AF_KTLS tool](https://github.com/fridex/af_ktls-tool), [AF_KTLS
+visualize](https://github.com/fridex/af_ktls-visualize).
 
