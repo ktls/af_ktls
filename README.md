@@ -20,6 +20,9 @@ patch were not merged, so you need to apply this patch in order to test
 scenarios or test your use case speed impact, visit [AF_KTLS
 tool](https://github.com/fridex/af_ktls-tool).
 
+You can find precompiled kernel for Fedora 23 with RFC 5288 patch applied
+[here](http://209.132.179.123:5000/).
+
 See [issues](http://github.com/fridex/af_ktls/issues) for awaiting
 enhancements or bugs.
 
