@@ -1234,6 +1234,7 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 			spd.partial[i].private = 0;
 			data_len -= copy;
 		}
+		data_len = TLS_CACHE_SIZE(tsk);
 
 		ret = splice_to_pipe(pipe, &spd);
 
@@ -1276,11 +1277,12 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 		if (ret < 0)
 			goto splice_read_end;
 
-		increment_seqno(tsk->iv_recv);
-
 		ret = splice_to_pipe(pipe, &spd);
-		if (ret > 0)
-			tls_pop_record(tsk, data_len);
+	}
+
+	if (ret > 0) {
+		increment_seqno(tsk->iv_recv);
+		tls_pop_record(tsk, data_len);
 	}
 
 splice_read_end:
