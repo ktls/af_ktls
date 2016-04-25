@@ -14,7 +14,12 @@ rmmod:
 	sudo rmmod af_ktls.ko
 
 clean:
-	sudo rmmod af_ktls.ko; make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+	KERNEL_DIR=$(KERNEL_DIR) $(MAKE) -C tests clean
+	sudo rmmod af_ktls.ko
+
+check:
+	KERNEL_DIR=$(KERNEL_DIR) $(MAKE) -C tests check
 
 .PHONY: insmod rmmod clean
 
