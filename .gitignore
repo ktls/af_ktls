@@ -8,3 +8,4 @@ af_ktls.mod.c
 af_ktls.mod.o
 af_ktls.o
 modules.order
+tests/dtls-window
