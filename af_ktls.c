@@ -155,7 +155,7 @@
 
 	void do_print_hex(const unsigned char * key, unsigned int keysize) {
 		int i = 0;
-	
+
 		printk("kdls: hex: ");
 		for (i = 0; i < keysize; i++)
 			printk("%02X", (unsigned char)key[i]);
@@ -359,7 +359,7 @@ static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
 	 * we will shift freed pages so chaining from AAD is correct and we
 	 * can use whole scatterlist next time
 	 */
-	memmove(sg, sg_start, 
+	memmove(sg, sg_start,
 		(KTLS_SG_DATA_SIZE - 1 - put_count)*sizeof(tsk->sendpage_ctx.sg[0]));
 	sg_mark_end(&sg[tsk->sendpage_ctx.used]);
 }
@@ -987,7 +987,7 @@ static inline ssize_t tls_peek_data(struct tls_sock *tsk, unsigned flags)
 		header = tsk->header_recv;
 		// we handle only application data, let user space decide what
 		// to do otherwise
-		// 
+		//
 		if (header[0] != KTLS_RECORD_DATA) {
 			ret = -EBADF;
 			goto peek_failure;
@@ -1254,7 +1254,7 @@ static int tls_recvmsg(struct socket *sock,
 	struct tls_sock *tsk;
 
 	xprintk("--> %s", __FUNCTION__);
-	
+
 	tsk = tls_sk(sock->sk);
 	mutex_lock(&tsk->rx_lock);
 	lock_sock(sock->sk);
