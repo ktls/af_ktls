@@ -4,8 +4,8 @@
  * Copyright (C) 2016
  *
  * Original authors:
- *   Fridolin Pokorny <fpokorny@redhat.com>
- *   Nikos Mavrogiannopoulos <nmav@redhat.com>
+ *   Fridolin Pokorny <fridolin.pokorny@gmail.com>
+ *   Nikos Mavrogiannopoulos <nmav@gnults.org>
  *
  * Based on RFC 5288, RFC 6347, RFC 5246, RFC 6655
  *
@@ -1823,7 +1823,7 @@ static void __exit tls_exit(void)
 module_init(tls_init);
 module_exit(tls_exit);
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Fridolin Pokorny <fpokorny@redhat.com>");
+MODULE_AUTHOR("Fridolin Pokorny <fridolin.pokorny@gmail.com>");
 MODULE_DESCRIPTION("TLS/DTLS kernel interface");
 
 /* vim: set foldmethod=syntax ts=8 sts=8 sw=8 noexpandtab */
