@@ -111,6 +111,10 @@
 						(S + KTLS_TLS_OVERHEAD) : \
 						(S + KTLS_DTLS_OVERHEAD))
 
+#define KTLS_MIN_RECORD_SIZE(T) 	(IS_TLS(T) ? \
+						(KTLS_TLS_OVERHEAD + 1) : \
+						(KTLS_DTLS_OVERHEAD + 1))
+
 /*
  * Nonce explicit offset in a record
  */
@@ -984,10 +988,14 @@ static inline ssize_t tls_peek_data(struct tls_sock *tsk, unsigned flags)
 			goto peek_failure;
 		}
 
+		if (peeked_size < KTLS_MIN_RECORD_SIZE(tsk)) {
+			ret = -EBADF;
+			goto peek_failure;
+		}
+
 		header = tsk->header_recv;
 		// we handle only application data, let user space decide what
 		// to do otherwise
-		//
 		if (header[0] != KTLS_RECORD_DATA) {
 			ret = -EBADF;
 			goto peek_failure;
