@@ -1010,7 +1010,7 @@ static inline ssize_t tls_peek_data(struct tls_sock *tsk, unsigned flags)
 
 		if (IS_TLS(tsk)) {
 			if (datagram_len > peeked_size) {
-				ret = -EFAULT;
+				ret = -EFAULT; // TODO: consider returning ENOMEM
 				goto peek_failure;
 			}
 		} else {
