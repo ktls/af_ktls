@@ -155,7 +155,7 @@
 
 	void do_print_hex(const unsigned char * key, unsigned int keysize) {
 		int i = 0;
-	
+
 		printk("kdls: hex: ");
 		for (i = 0; i < keysize; i++)
 			printk("%02X", (unsigned char)key[i]);
@@ -359,7 +359,7 @@ static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
 	 * we will shift freed pages so chaining from AAD is correct and we
 	 * can use whole scatterlist next time
 	 */
-	memmove(sg, sg_start, 
+	memmove(sg, sg_start,
 		(KTLS_SG_DATA_SIZE - 1 - put_count)*sizeof(tsk->sendpage_ctx.sg[0]));
 	sg_mark_end(&sg[tsk->sendpage_ctx.used]);
 }
@@ -922,7 +922,8 @@ static int tls_do_decryption(const struct tls_sock *tsk,
 	aead_request_set_tfm(aead_req, tsk->aead_recv);
 	aead_request_set_ad(aead_req, KTLS_PADDED_AAD_SIZE);
 	aead_request_set_crypt(aead_req, sgin, sgout,
-			data_len + KTLS_TAG_SIZE, tsk->iv_recv);
+			data_len + KTLS_TAG_SIZE,
+			       (u8*)tsk->header_recv + KTLS_NONCE_OFFSET(tsk));
 
 	ret = af_alg_wait_for_completion(
 			crypto_aead_decrypt(aead_req),
@@ -987,7 +988,7 @@ static inline ssize_t tls_peek_data(struct tls_sock *tsk, unsigned flags)
 		header = tsk->header_recv;
 		// we handle only application data, let user space decide what
 		// to do otherwise
-		// 
+		//
 		if (header[0] != KTLS_RECORD_DATA) {
 			ret = -EBADF;
 			goto peek_failure;
@@ -1057,7 +1058,7 @@ static void tls_rx_async_work(struct work_struct *w)
 			goto rx_work_end;
 
 		tls_make_aad(tsk, 1, tsk->aad_recv, data_len,
-				tsk->header_recv + KTLS_NONCE_OFFSET(tsk));
+			     tsk->iv_recv);
 
 		ret = tls_do_decryption(tsk, tsk->sg_rx_data,
 				tsk->sg_rx_async_work, data_len);
@@ -1215,7 +1216,7 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 		sg_chain(sg, ret + 1, tsk->sgtag_recv);
 
 		tls_make_aad(tsk, 1, tsk->aad_recv, data_len,
-				tsk->header_recv + KTLS_NONCE_OFFSET(tsk));
+			     tsk->iv_recv);
 
 		ret = tls_do_decryption(tsk, tsk->sg_rx_data,
 				tsk->sgaad_recv, data_len);
@@ -1254,7 +1255,7 @@ static int tls_recvmsg(struct socket *sock,
 	struct tls_sock *tsk;
 
 	xprintk("--> %s", __FUNCTION__);
-	
+
 	tsk = tls_sk(sock->sk);
 	mutex_lock(&tsk->rx_lock);
 	lock_sock(sock->sk);
@@ -1312,7 +1313,7 @@ static int tls_recvmsg(struct socket *sock,
 		}
 
 		tls_make_aad(tsk, 1, tsk->aad_recv, data_len,
-				tsk->header_recv + KTLS_NONCE_OFFSET(tsk));
+			     tsk->iv_recv);
 
 		ret = tls_do_decryption(tsk,
 				tsk->sg_rx_data,
@@ -1827,4 +1828,3 @@ MODULE_AUTHOR("Fridolin Pokorny <fpokorny@redhat.com>");
 MODULE_DESCRIPTION("TLS/DTLS kernel interface");
 
 /* vim: set foldmethod=syntax ts=8 sts=8 sw=8 noexpandtab */
-
