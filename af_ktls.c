@@ -155,7 +155,7 @@
 
 	void do_print_hex(const unsigned char * key, unsigned int keysize) {
 		int i = 0;
-	
+
 		printk("kdls: hex: ");
 		for (i = 0; i < keysize; i++)
 			printk("%02X", (unsigned char)key[i]);
@@ -183,6 +183,8 @@ struct tls_sock {
 	 * TCP/UDP socket we are binded to
 	 */
 	struct socket *socket;
+
+	int rx_stopped;
 
 	/*
 	 * Context for {set,get}sockopt()
@@ -359,7 +361,7 @@ static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
 	 * we will shift freed pages so chaining from AAD is correct and we
 	 * can use whole scatterlist next time
 	 */
-	memmove(sg, sg_start, 
+	memmove(sg, sg_start,
 		(KTLS_SG_DATA_SIZE - 1 - put_count)*sizeof(tsk->sendpage_ctx.sg[0]));
 	sg_mark_end(&sg[tsk->sendpage_ctx.used]);
 }
@@ -375,8 +377,12 @@ static void tls_data_ready(struct sock *sk)
 	read_lock_bh(&sk->sk_callback_lock);
 
 	tsk = (struct tls_sock *)sk->sk_user_data;
+	if (unlikely(!tsk || tsk->rx_stopped)) {
+		goto out;
+	}
 	queue_work(tls_wq, &tsk->recv_work);
 
+  out:
 	read_unlock_bh(&sk->sk_callback_lock);
 }
 
@@ -987,7 +993,7 @@ static inline ssize_t tls_peek_data(struct tls_sock *tsk, unsigned flags)
 		header = tsk->header_recv;
 		// we handle only application data, let user space decide what
 		// to do otherwise
-		// 
+		//
 		if (header[0] != KTLS_RECORD_DATA) {
 			ret = -EBADF;
 			goto peek_failure;
@@ -1254,7 +1260,7 @@ static int tls_recvmsg(struct socket *sock,
 	struct tls_sock *tsk;
 
 	xprintk("--> %s", __FUNCTION__);
-	
+
 	tsk = tls_sk(sock->sk);
 	mutex_lock(&tsk->rx_lock);
 	lock_sock(sock->sk);
@@ -1514,9 +1520,12 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		goto bind_end;
 	}
 
+	write_lock_bh(&tsk->socket->sk->sk_callback_lock);
+	tsk->rx_stopped = 0;
 	tsk->saved_sk_data_ready = tsk->socket->sk->sk_data_ready;
 	tsk->socket->sk->sk_data_ready = tls_data_ready;
 	tsk->socket->sk->sk_user_data = tsk;
+	write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
 
 	return 0;
 
@@ -1579,8 +1588,15 @@ static void tls_sock_destruct(struct sock *sk)
 
 	// restore callback and abandon socket
 	if (tsk->socket) {
+		write_lock_bh(&tsk->socket->sk->sk_callback_lock);
+
+		tsk->rx_stopped = 1;
 		tsk->socket->sk->sk_data_ready = tsk->saved_sk_data_ready;
+		tsk->socket->sk->sk_user_data = NULL;
+		write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
+
 		fput(tsk->socket->file);
+		tsk->socket = NULL;
 	}
 
 	if (tsk->iv_send)
@@ -1827,4 +1843,3 @@ MODULE_AUTHOR("Fridolin Pokorny <fpokorny@redhat.com>");
 MODULE_DESCRIPTION("TLS/DTLS kernel interface");
 
 /* vim: set foldmethod=syntax ts=8 sts=8 sw=8 noexpandtab */
-
