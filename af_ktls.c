@@ -6,6 +6,7 @@
  * Original authors:
  *   Fridolin Pokorny <fridolin.pokorny@gmail.com>
  *   Nikos Mavrogiannopoulos <nmav@gnults.org>
+ *   Dave Watson <davejwatson@fb.com>
  *
  * Based on RFC 5288, RFC 6347, RFC 5246, RFC 6655
  *
