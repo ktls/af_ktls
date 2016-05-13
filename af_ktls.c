@@ -184,6 +184,8 @@ struct tls_sock {
 	 */
 	struct socket *socket;
 
+	int rx_stopped;
+
 	/*
 	 * Context for {set,get}sockopt()
 	 */
@@ -375,8 +377,12 @@ static void tls_data_ready(struct sock *sk)
 	read_lock_bh(&sk->sk_callback_lock);
 
 	tsk = (struct tls_sock *)sk->sk_user_data;
+	if (unlikely(!tsk || tsk->rx_stopped)) {
+		goto out;
+	}
 	queue_work(tls_wq, &tsk->recv_work);
 
+  out:
 	read_unlock_bh(&sk->sk_callback_lock);
 }
 
@@ -1515,9 +1521,12 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		goto bind_end;
 	}
 
+	write_lock_bh(&tsk->socket->sk->sk_callback_lock);
+	tsk->rx_stopped = 0;
 	tsk->saved_sk_data_ready = tsk->socket->sk->sk_data_ready;
 	tsk->socket->sk->sk_data_ready = tls_data_ready;
 	tsk->socket->sk->sk_user_data = tsk;
+	write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
 
 	return 0;
 
@@ -1580,8 +1589,15 @@ static void tls_sock_destruct(struct sock *sk)
 
 	// restore callback and abandon socket
 	if (tsk->socket) {
+		write_lock_bh(&tsk->socket->sk->sk_callback_lock);
+
+		tsk->rx_stopped = 1;
 		tsk->socket->sk->sk_data_ready = tsk->saved_sk_data_ready;
+		tsk->socket->sk->sk_user_data = NULL;
+		write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
+
 		fput(tsk->socket->file);
+		tsk->socket = NULL;
 	}
 
 	if (tsk->iv_send)
