@@ -922,7 +922,8 @@ static int tls_do_decryption(const struct tls_sock *tsk,
 	aead_request_set_tfm(aead_req, tsk->aead_recv);
 	aead_request_set_ad(aead_req, KTLS_PADDED_AAD_SIZE);
 	aead_request_set_crypt(aead_req, sgin, sgout,
-			data_len + KTLS_TAG_SIZE, tsk->iv_recv);
+			data_len + KTLS_TAG_SIZE,
+			       (u8*)tsk->header_recv + KTLS_NONCE_OFFSET(tsk));
 
 	ret = af_alg_wait_for_completion(
 			crypto_aead_decrypt(aead_req),
@@ -1057,7 +1058,7 @@ static void tls_rx_async_work(struct work_struct *w)
 			goto rx_work_end;
 
 		tls_make_aad(tsk, 1, tsk->aad_recv, data_len,
-				tsk->header_recv + KTLS_NONCE_OFFSET(tsk));
+			     tsk->iv_recv);
 
 		ret = tls_do_decryption(tsk, tsk->sg_rx_data,
 				tsk->sg_rx_async_work, data_len);
@@ -1215,7 +1216,7 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 		sg_chain(sg, ret + 1, tsk->sgtag_recv);
 
 		tls_make_aad(tsk, 1, tsk->aad_recv, data_len,
-				tsk->header_recv + KTLS_NONCE_OFFSET(tsk));
+			     tsk->iv_recv);
 
 		ret = tls_do_decryption(tsk, tsk->sg_rx_data,
 				tsk->sgaad_recv, data_len);
@@ -1312,7 +1313,7 @@ static int tls_recvmsg(struct socket *sock,
 		}
 
 		tls_make_aad(tsk, 1, tsk->aad_recv, data_len,
-				tsk->header_recv + KTLS_NONCE_OFFSET(tsk));
+			     tsk->iv_recv);
 
 		ret = tls_do_decryption(tsk,
 				tsk->sg_rx_data,
@@ -1827,4 +1828,3 @@ MODULE_AUTHOR("Fridolin Pokorny <fridolin.pokorny@gmail.com>");
 MODULE_DESCRIPTION("TLS/DTLS kernel interface");
 
 /* vim: set foldmethod=syntax ts=8 sts=8 sw=8 noexpandtab */
-
