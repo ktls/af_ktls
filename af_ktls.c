@@ -1052,6 +1052,12 @@ static void tls_rx_async_work(struct work_struct *w)
 
 	if (mutex_trylock(&tsk->rx_lock)) {
 		lock_sock(sk);
+		read_lock_bh(&sk->sk_callback_lock);
+
+		if (!tsk->socket || tsk->rx_stopped) {
+			goto rx_work_end;
+		}
+
 		// already occupied?
 		if (TLS_CACHE_SIZE(tsk) != 0)
 			goto rx_work_end;
@@ -1075,6 +1081,7 @@ static void tls_rx_async_work(struct work_struct *w)
 		TLS_CACHE_SET_SIZE(tsk, data_len);
 
 rx_work_end:
+		read_unlock_bh(&sk->sk_callback_lock);
 		release_sock(sk);
 		mutex_unlock(&tsk->rx_lock);
 	} else {
