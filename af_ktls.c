@@ -1809,25 +1809,23 @@ static int __init tls_init(void)
 
 	tls_wq = create_workqueue("ktls");
 	if (!tls_wq)
-		goto out;
+		goto tls_init_end;
 
 	ret = proto_register(&tls_proto, 0);
-
-	if (ret)
-		goto out;
+	if (ret) {
+		destroy_workqueue(tls_wq);
+		goto tls_init_end;
+	}
 
 	ret = sock_register(&tls_family);
-	if (ret != 0)
-		goto out_unregister_proto;
-
-out:
-	return ret;
-
-out_unregister_proto:
-	proto_unregister(&tls_proto);
-	if (tls_wq)
+	if (ret != 0) {
+		proto_unregister(&tls_proto);
 		destroy_workqueue(tls_wq);
-	return 0;
+		goto tls_init_end;
+	}
+
+tls_init_end:
+	return ret;
 }
 
 static void __exit tls_exit(void)
