@@ -1532,6 +1532,8 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	return 0;
 
 bind_end:
+	sockfd_put(tsk->socket);
+	tsk->socket = NULL;
 	return ret;
 }
 
