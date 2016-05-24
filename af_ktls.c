@@ -1539,6 +1539,8 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	return 0;
 
 bind_end:
+	sockfd_put(tsk->socket);
+	tsk->socket = NULL;
 	return ret;
 }
 
@@ -1604,7 +1606,7 @@ static void tls_sock_destruct(struct sock *sk)
 		tsk->socket->sk->sk_user_data = NULL;
 		write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
 
-		fput(tsk->socket->file);
+		sockfd_put(tsk->socket);
 		tsk->socket = NULL;
 	}
 
