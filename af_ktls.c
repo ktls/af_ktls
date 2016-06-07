@@ -102,8 +102,18 @@
 						(T)->iv_recv && \
 						KTLS_GETSOCKOPT_READY(T))
 
-#define IS_TLS(T)			(T->tls)
+#define IS_TLS(T)			((T)->sk.sk_type == SOCK_STREAM)
 #define IS_DTLS(T)			(!IS_TLS(T))
+
+/*
+ * Distinguish bound socket type
+ */
+#define IS_INET46(S)			((S)->sk->sk_family == AF_INET || \
+						(S)->sk->sk_family == AF_INET6)
+#define IS_TCP(S)			(IS_INET46(S) && \
+						(S)->sk->sk_type == SOCK_STREAM)
+#define IS_UDP(S)			(IS_INET46(S) && \
+						(S)->sk->sk_type == SOCK_DGRAM)
 
 /*
  * Real size of a record based on data carried
@@ -246,11 +256,6 @@ struct tls_sock {
 	 * TLS/DTLS version for header
 	 */
 	char version[2];
-
-	/*
-	 * nonzero if TLS, zero for DTLS
-	 */
-	int tls;
 
 	/*
 	 * additional options, e.g. OpenConnect protocol
@@ -824,12 +829,12 @@ static inline void tls_pop_record(struct tls_sock *tsk, size_t data_len)
 
 	xprintk("--> %s", __FUNCTION__);
 
-	if (IS_TLS(tsk)) {
+	if (IS_TCP(tsk->socket)) {
 		ret = kernel_recvmsg(tsk->socket, &msg,
 				tsk->vec_recv, KTLS_VEC_SIZE,
 				KTLS_RECORD_SIZE(tsk, data_len), MSG_TRUNC);
 		WARN_ON(ret != KTLS_RECORD_SIZE(tsk, data_len));
-	} else {
+	} else { /* UDP */
 		ret = kernel_recvmsg(tsk->socket,
 				&msg, tsk->vec_recv, KTLS_VEC_SIZE,
 				/*size*/0, /*flags*/0);
@@ -1511,6 +1516,19 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	if (tsk->socket == NULL)
 		return -ENOENT;
 
+	if (!IS_TCP(tsk->socket) && !IS_UDP(tsk->socket)) {
+		ret = -EAFNOSUPPORT;
+		goto bind_end;
+	}
+
+	/*
+	 * Do not allow TLS over unreliable UDP
+	 */
+	if (IS_TLS(tsk) && IS_UDP(tsk->socket)) {
+		ret = -EBADF;
+		goto bind_end;
+	}
+
 	xprintk("--1");
 	tsk->aead_recv = crypto_alloc_aead(tsk->cipher_crypto,
 			CRYPTO_ALG_INTERNAL, 0);
@@ -1673,7 +1691,6 @@ static int tls_create(struct net *net,
 	// initialize stored context
 	tsk = tls_sk(sk);
 
-	tsk->tls = (sock->type == SOCK_STREAM);
 	tsk->iv_send = NULL;
 	memset(&tsk->key_send, 0, sizeof(tsk->key_send));
 
