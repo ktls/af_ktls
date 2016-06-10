@@ -136,12 +136,6 @@
 #define TLS_CACHE_SIZE(T)		(T->recv_occupied)
 #define TLS_CACHE_SET_SIZE(T, S)	(T->recv_occupied = S)
 
-/*
- * OpenConnect stuff
- *   uncompressed data can be served without user space
- */
-#define OPENCONNECT_PKT_DATA		0x00
-
 //#define KTLS_DEBUG
 
 #if 1 // TODO: remove once ready to use
@@ -604,12 +598,6 @@ static int tls_setsockopt(struct socket *sock,
 		case KTLS_SET_MTU:
 			ret = tls_set_mtu(sock, optval, optlen);
 			break;
-		case KTLS_PROTO_OPENCONNECT:
-			if (optval == NULL && optlen == 0) {
-				tsk->opts |= KTLS_PROTO_OPENCONNECT;
-				ret = 0;
-			}
-			break;
 		default:
 			break;
 	}
@@ -946,28 +934,14 @@ static int tls_do_decryption(const struct tls_sock *tsk,
 
 static int tls_post_process(const struct tls_sock *tsk, struct scatterlist *sgl)
 {
-	int ret;
-	char *bytes;
-	struct scatterlist *sg;
-
-	xprintk("--> %s", __FUNCTION__);
-
-	ret = -EBADMSG;
-
-	sg = sgl;
-
-	if (tsk->opts & KTLS_PROTO_OPENCONNECT) {
-		/* skip TLS/DTLS header header */
-		sg = sg_next(sg);
-		bytes = page_address(sg_page(sg)) + sg->offset;
-		if (bytes[0] != OPENCONNECT_PKT_DATA)
-			goto postprocess_failure;
-	}
+	/* Placeholder for future extensibility via BPF or something similar.
+	 * On several occasions we need to act based on the contents of the
+	 * decrypted data (e.g., give control directly to userspace with a special
+	 * error, etc). This will allow for protocols like Openconnect VPN to
+	 * use this framework and handle specially the packets which are not data.
+	 */
 
 	return 0;
-
-postprocess_failure:
-	return ret;
 }
 
 static inline ssize_t tls_peek_data(struct tls_sock *tsk, unsigned flags)
@@ -1675,7 +1649,7 @@ static int tls_create(struct net *net,
 	if (sock->type != SOCK_DGRAM && sock->type != SOCK_STREAM)
 		return -ESOCKTNOSUPPORT;
 
-	if ((protocol != 0) && (protocol ^ KTLS_PROTO_OPENCONNECT))
+	if (protocol != 0)
 		return -EPROTONOSUPPORT;
 
 	sk = sk_alloc(net, PF_KTLS, GFP_ATOMIC, &tls_proto, kern);
