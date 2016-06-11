@@ -252,11 +252,6 @@ struct tls_sock {
 	char version[2];
 
 	/*
-	 * additional options, e.g. OpenConnect protocol
-	 */
-	unsigned opts;
-
-	/*
 	 * store mtu for raw payload -- without header, tag, (and seq num
 	 * when DTLS)
 	 */
@@ -1688,8 +1683,6 @@ static int tls_create(struct net *net,
 	sg_mark_end(&tsk->sendpage_ctx.sg[0]);
 
 	mutex_init(&tsk->rx_lock);
-
-	tsk->opts = protocol;
 
 	tsk->pages_send = tsk->pages_recv = tsk->pages_work = NULL;
 
