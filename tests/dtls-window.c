@@ -29,7 +29,7 @@ struct tls_sock {
 	memset(&state, 0, sizeof(state))
 
 #define SET_WINDOW_START(x) \
-	state.dtls_window.start = x
+	state.dtls_window.start = (x&DTLS_SEQ_NUM_MASK)
 
 #define SET_WINDOW_LAST_RECV(x) \
 	t = cpu_to_be64(x); \
