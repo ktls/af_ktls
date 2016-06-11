@@ -227,7 +227,7 @@ struct tls_sock {
 	char aad_recv[KTLS_AAD_SPACE_SIZE];
 	char tag_recv[KTLS_TAG_SIZE];
 	struct page *pages_recv;
-	struct af_alg_sgl sgl_recv;
+	struct af_alg_sgl sgl_recv[UIO_MAXIOV];
 	struct scatterlist sgaad_recv[2];
 	struct scatterlist sgtag_recv[2];
 
@@ -1222,7 +1222,7 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 
 splice_read_end:
 	// restore chaining for receiving
-	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv.sg);
+	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv[0].sg);
 
 	if (ret > 0)
 		queue_work(tls_wq, &tsk->recv_work);
@@ -1238,10 +1238,12 @@ static int tls_recvmsg(struct socket *sock,
 		size_t size,
 		int flags)
 {
-	int ret, i;
+	int i;
 	size_t copy, copied;
 	ssize_t data_len;
 	struct tls_sock *tsk;
+	int ret = 0;
+	unsigned int cnt = 0;
 
 	xprintk("--> %s", __FUNCTION__);
 
@@ -1282,12 +1284,19 @@ static int tls_recvmsg(struct socket *sock,
 		ret = TLS_CACHE_SIZE(tsk);
 		TLS_CACHE_DISCARD(tsk);
 	} else {
-		ret = af_alg_make_sg(&tsk->sgl_recv, &msg->msg_iter, size);
-		if (ret < 0)
-			goto recv_end;
-
-		sg_unmark_end(&tsk->sgl_recv.sg[tsk->sgl_recv.npages - 1]);
-		sg_chain(tsk->sgl_recv.sg, tsk->sgl_recv.npages + 1, tsk->sgtag_recv);
+		while (iov_iter_count(&msg->msg_iter)) {
+			size_t seglen = iov_iter_count(&msg->msg_iter);
+			int len = af_alg_make_sg(&tsk->sgl_recv[cnt], &msg->msg_iter, seglen);
+			if (len < 0)
+				goto recv_end;
+			ret += len;
+			if (cnt)
+				af_alg_link_sg(&tsk->sgl_recv[cnt-1], &tsk->sgl_recv[cnt]);
+			iov_iter_advance(&msg->msg_iter, len);
+			cnt++;
+		}
+		sg_unmark_end(&tsk->sgl_recv[cnt-1].sg[tsk->sgl_recv[cnt-1].npages - 1]);
+		sg_chain(tsk->sgl_recv[cnt-1].sg, tsk->sgl_recv[cnt-1].npages + 1, tsk->sgtag_recv);
 
 		data_len = tls_peek_data(tsk, 0);
 
@@ -1324,7 +1333,8 @@ static int tls_recvmsg(struct socket *sock,
 recv_end:
 	if (ret > 0)
 		queue_work(tls_wq, &tsk->recv_work);
-
+	for (i = 0; i < cnt; i++)
+		af_alg_free_sg(&tsk->sgl_recv[i]);
 	release_sock(sock->sk);
 	mutex_unlock(&tsk->rx_lock);
 
@@ -1757,7 +1767,8 @@ static int tls_create(struct net *net,
 		tsk->vec_recv[i].iov_len = tsk->sg_rx_data[i].length;
 	}
 
-	memset(&tsk->sgl_recv, 0, sizeof(tsk->sgl_recv));
+	for (i = 0; i < UIO_MAXIOV; i++)
+		memset(&tsk->sgl_recv[i], 0, sizeof(tsk->sgl_recv[i]));
 	sg_init_table(tsk->sgaad_recv, 2);
 	sg_init_table(tsk->sgtag_recv, 2);
 
@@ -1766,7 +1777,7 @@ static int tls_create(struct net *net,
 	sg_set_buf(&tsk->sgtag_recv[0], tsk->tag_recv, sizeof(tsk->tag_recv));
 
 	sg_unmark_end(&tsk->sgaad_recv[1]);
-	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv.sg);
+	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv[0].sg);
 
 	// preallocation for asynchronous worker, where decrypted data are stored
 	sg_init_table(tsk->sg_rx_async_work, KTLS_SG_DATA_SIZE);
