@@ -19,7 +19,7 @@ struct tls_sock {
 	char iv_recv[32];
 	struct {
 		uint64_t bits;
-		unsigned start;
+		uint64_t start;
 	} dtls_window;
 };
 

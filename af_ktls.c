@@ -273,7 +273,8 @@ struct tls_sock {
 	 */
 	struct {
 		uint64_t bits;
-		unsigned start;
+		/* The starting point of the sliding window without epoch */
+		uint64_t start;
 	} dtls_window;
 
 	/*
