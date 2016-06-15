@@ -50,6 +50,11 @@
 #define KTLS_GET_MTU			17
 
 /*
+ * Additional options
+ */
+#define KTLS_PROTO_OPENCONNECT		128
+
+/*
  * Supported ciphers
  */
 #define KTLS_CIPHER_AES_GCM_128		51

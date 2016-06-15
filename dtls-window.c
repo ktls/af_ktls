@@ -8,10 +8,6 @@
 
 #define DTLS_SAME_EPOCH(S1, S2)		(((S1) >> DTLS_EPOCH_SHIFT) == ((S2) >> DTLS_EPOCH_SHIFT))
 
-/* This check cannot handle the case of a freshly initialized sliding
- * window, and a packet with sequence nr of 0 being received. However,
- * since in TLS the first encrypted packet sent, is the Finished one,
- * we never trigger that issue. */
 #define DTLS_WINDOW_INSIDE(W, S)	((((S) & DTLS_SEQ_NUM_MASK) > (W).start) && \
 						(((S)  & DTLS_SEQ_NUM_MASK) - (W).start <= (sizeof((W).bits) * CHAR_BIT)))
 
