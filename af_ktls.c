@@ -102,18 +102,8 @@
 						(T)->iv_recv && \
 						KTLS_GETSOCKOPT_READY(T))
 
-#define IS_TLS(T)			((T)->sk.sk_type == SOCK_STREAM)
+#define IS_TLS(T)			(T->tls)
 #define IS_DTLS(T)			(!IS_TLS(T))
-
-/*
- * Distinguish bound socket type
- */
-#define IS_INET46(S)			((S)->sk->sk_family == AF_INET || \
-						(S)->sk->sk_family == AF_INET6)
-#define IS_TCP(S)			(IS_INET46(S) && \
-						(S)->sk->sk_type == SOCK_STREAM)
-#define IS_UDP(S)			(IS_INET46(S) && \
-						(S)->sk->sk_type == SOCK_DGRAM)
 
 /*
  * Real size of a record based on data carried
@@ -135,6 +125,12 @@
 #define TLS_CACHE_DISCARD(T)		(T->recv_occupied = 0)
 #define TLS_CACHE_SIZE(T)		(T->recv_occupied)
 #define TLS_CACHE_SET_SIZE(T, S)	(T->recv_occupied = S)
+
+/*
+ * OpenConnect stuff
+ *   uncompressed data can be served without user space
+ */
+#define OPENCONNECT_PKT_DATA		0x00
 
 //#define KTLS_DEBUG
 
@@ -212,7 +208,7 @@ struct tls_sock {
 	char aad_send[KTLS_AAD_SPACE_SIZE];
 	char tag_send[KTLS_TAG_SIZE];
 	struct page *pages_send;
-	struct af_alg_sgl sgl_send;
+	struct af_alg_sgl sgl_send[UIO_MAXIOV];
 	struct scatterlist sgaad_send[2];
 	struct scatterlist sgtag_send[2];
 
@@ -227,7 +223,7 @@ struct tls_sock {
 	char aad_recv[KTLS_AAD_SPACE_SIZE];
 	char tag_recv[KTLS_TAG_SIZE];
 	struct page *pages_recv;
-	struct af_alg_sgl sgl_recv;
+	struct af_alg_sgl sgl_recv[UIO_MAXIOV];
 	struct scatterlist sgaad_recv[2];
 	struct scatterlist sgtag_recv[2];
 
@@ -252,6 +248,16 @@ struct tls_sock {
 	char version[2];
 
 	/*
+	 * nonzero if TLS, zero for DTLS
+	 */
+	int tls;
+
+	/*
+	 * additional options, e.g. OpenConnect protocol
+	 */
+	unsigned opts;
+
+	/*
 	 * store mtu for raw payload -- without header, tag, (and seq num
 	 * when DTLS)
 	 */
@@ -262,8 +268,7 @@ struct tls_sock {
 	 */
 	struct {
 		uint64_t bits;
-		/* The starting point of the sliding window without epoch */
-		uint64_t start;
+		unsigned start;
 	} dtls_window;
 
 	/*
@@ -594,6 +599,12 @@ static int tls_setsockopt(struct socket *sock,
 		case KTLS_SET_MTU:
 			ret = tls_set_mtu(sock, optval, optlen);
 			break;
+		case KTLS_PROTO_OPENCONNECT:
+			if (optval == NULL && optlen == 0) {
+				tsk->opts |= KTLS_PROTO_OPENCONNECT;
+				ret = 0;
+			}
+			break;
 		default:
 			break;
 	}
@@ -813,12 +824,12 @@ static inline void tls_pop_record(struct tls_sock *tsk, size_t data_len)
 
 	xprintk("--> %s", __FUNCTION__);
 
-	if (IS_TCP(tsk->socket)) {
+	if (IS_TLS(tsk)) {
 		ret = kernel_recvmsg(tsk->socket, &msg,
 				tsk->vec_recv, KTLS_VEC_SIZE,
 				KTLS_RECORD_SIZE(tsk, data_len), MSG_TRUNC);
 		WARN_ON(ret != KTLS_RECORD_SIZE(tsk, data_len));
-	} else { /* UDP */
+	} else {
 		ret = kernel_recvmsg(tsk->socket,
 				&msg, tsk->vec_recv, KTLS_VEC_SIZE,
 				/*size*/0, /*flags*/0);
@@ -850,9 +861,10 @@ static int tls_do_encryption(struct tls_sock *tsk,
 
 static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 {
-	int ret;
 	struct tls_sock *tsk;
-
+	unsigned int i;
+	unsigned int cnt = 0;
+	int ret = 0;
 	xprintk("--> %s", __FUNCTION__);
 
 	tsk = tls_sk(sock->sk);
@@ -872,15 +884,23 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 
 	tls_make_aad(tsk, 0, tsk->aad_send, size, tsk->iv_send);
 
-	ret = af_alg_make_sg(&tsk->sgl_send, &msg->msg_iter, size);
-	if (ret < 0)
-		goto send_end;
+	while (iov_iter_count(&msg->msg_iter)) {
+		size_t seglen = iov_iter_count(&msg->msg_iter);
+		int len = af_alg_make_sg(&tsk->sgl_send[cnt], &msg->msg_iter, seglen);
+		if (len < 0)
+			goto send_end;
+		ret += len;
+		if (cnt)
+			af_alg_link_sg(&tsk->sgl_send[cnt-1], &tsk->sgl_send[cnt]);
+		iov_iter_advance(&msg->msg_iter, len);
+		cnt++;
+	}
 
 	sg_unmark_end(&tsk->sgaad_send[1]);
-	sg_chain(tsk->sgaad_send, 2, tsk->sgl_send.sg);
+	sg_chain(tsk->sgaad_send, 2, tsk->sgl_send[0].sg);
 
-	sg_unmark_end(tsk->sgl_send.sg + tsk->sgl_send.npages - 1);
-	sg_chain(tsk->sgl_send.sg, tsk->sgl_send.npages + 1, tsk->sgtag_send);
+	sg_unmark_end(tsk->sgl_send[cnt-1].sg + tsk->sgl_send[cnt-1].npages - 1);
+	sg_chain(tsk->sgl_send[cnt-1].sg, tsk->sgl_send[cnt-1].npages + 1, tsk->sgtag_send);
 
 	ret = tls_do_encryption(tsk, tsk->sgaad_send, tsk->sg_tx_data, size);
 	if (ret < 0)
@@ -897,6 +917,8 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	}
 
 send_end:
+	for(i=0;i<cnt;i++)
+		af_alg_free_sg(&tsk->sgl_send[i]);
 	release_sock(sock->sk);
 	return ret;
 }
@@ -930,14 +952,28 @@ static int tls_do_decryption(const struct tls_sock *tsk,
 
 static int tls_post_process(const struct tls_sock *tsk, struct scatterlist *sgl)
 {
-	/* Placeholder for future extensibility via BPF or something similar.
-	 * On several occasions we need to act based on the contents of the
-	 * decrypted data (e.g., give control directly to userspace with a special
-	 * error, etc). This will allow for protocols like Openconnect VPN to
-	 * use this framework and handle specially the packets which are not data.
-	 */
+	int ret;
+	char *bytes;
+	struct scatterlist *sg;
+
+	xprintk("--> %s", __FUNCTION__);
+
+	ret = -EBADMSG;
+
+	sg = sgl;
+
+	if (tsk->opts & KTLS_PROTO_OPENCONNECT) {
+		/* skip TLS/DTLS header header */
+		sg = sg_next(sg);
+		bytes = page_address(sg_page(sg)) + sg->offset;
+		if (bytes[0] != OPENCONNECT_PKT_DATA)
+			goto postprocess_failure;
+	}
 
 	return 0;
+
+postprocess_failure:
+	return ret;
 }
 
 static inline ssize_t tls_peek_data(struct tls_sock *tsk, unsigned flags)
@@ -1222,7 +1258,7 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 
 splice_read_end:
 	// restore chaining for receiving
-	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv.sg);
+	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv[0].sg);
 
 	if (ret > 0)
 		queue_work(tls_wq, &tsk->recv_work);
@@ -1238,10 +1274,12 @@ static int tls_recvmsg(struct socket *sock,
 		size_t size,
 		int flags)
 {
-	int ret, i;
+	int i;
 	size_t copy, copied;
 	ssize_t data_len;
 	struct tls_sock *tsk;
+	int ret = 0;
+	unsigned int cnt = 0;
 
 	xprintk("--> %s", __FUNCTION__);
 
@@ -1282,12 +1320,19 @@ static int tls_recvmsg(struct socket *sock,
 		ret = TLS_CACHE_SIZE(tsk);
 		TLS_CACHE_DISCARD(tsk);
 	} else {
-		ret = af_alg_make_sg(&tsk->sgl_recv, &msg->msg_iter, size);
-		if (ret < 0)
-			goto recv_end;
-
-		sg_unmark_end(&tsk->sgl_recv.sg[tsk->sgl_recv.npages - 1]);
-		sg_chain(tsk->sgl_recv.sg, tsk->sgl_recv.npages + 1, tsk->sgtag_recv);
+		while (iov_iter_count(&msg->msg_iter)) {
+			size_t seglen = iov_iter_count(&msg->msg_iter);
+			int len = af_alg_make_sg(&tsk->sgl_recv[cnt], &msg->msg_iter, seglen);
+			if (len < 0)
+				goto recv_end;
+			ret += len;
+			if (cnt)
+				af_alg_link_sg(&tsk->sgl_recv[cnt-1], &tsk->sgl_recv[cnt]);
+			iov_iter_advance(&msg->msg_iter, len);
+			cnt++;
+		}
+		sg_unmark_end(&tsk->sgl_recv[cnt-1].sg[tsk->sgl_recv[cnt-1].npages - 1]);
+		sg_chain(tsk->sgl_recv[cnt-1].sg, tsk->sgl_recv[cnt-1].npages + 1, tsk->sgtag_recv);
 
 		data_len = tls_peek_data(tsk, 0);
 
@@ -1324,7 +1369,8 @@ static int tls_recvmsg(struct socket *sock,
 recv_end:
 	if (ret > 0)
 		queue_work(tls_wq, &tsk->recv_work);
-
+	for(i=0;i<cnt;i++)
+		af_alg_free_sg(&tsk->sgl_recv[i]);
 	release_sock(sock->sk);
 	mutex_unlock(&tsk->rx_lock);
 
@@ -1372,7 +1418,7 @@ static ssize_t tls_do_sendpage(struct tls_sock *tsk)
 
 do_sendmsg_end:
 	// restore, so we can use sendmsg()
-	sg_chain(tsk->sgaad_send, 2, tsk->sgl_send.sg);
+	sg_chain(tsk->sgaad_send, 2, tsk->sgl_send[0].sg);
 	// remove chaining to sg tag
 	sg_mark_end(&tsk->sendpage_ctx.sg[tsk->sendpage_ctx.used]);
 
@@ -1485,19 +1531,6 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	tsk->socket = sockfd_lookup(sa_ktls->sa_socket, &ret);
 	if (tsk->socket == NULL)
 		return -ENOENT;
-
-	if (!IS_TCP(tsk->socket) && !IS_UDP(tsk->socket)) {
-		ret = -EAFNOSUPPORT;
-		goto bind_end;
-	}
-
-	/*
-	 * Do not allow TLS over unreliable UDP
-	 */
-	if (IS_TLS(tsk) && IS_UDP(tsk->socket)) {
-		ret = -EBADF;
-		goto bind_end;
-	}
 
 	xprintk("--1");
 	tsk->aead_recv = crypto_alloc_aead(tsk->cipher_crypto,
@@ -1645,7 +1678,7 @@ static int tls_create(struct net *net,
 	if (sock->type != SOCK_DGRAM && sock->type != SOCK_STREAM)
 		return -ESOCKTNOSUPPORT;
 
-	if (protocol != 0)
+	if ((protocol != 0) && (protocol ^ KTLS_PROTO_OPENCONNECT))
 		return -EPROTONOSUPPORT;
 
 	sk = sk_alloc(net, PF_KTLS, GFP_ATOMIC, &tls_proto, kern);
@@ -1661,6 +1694,7 @@ static int tls_create(struct net *net,
 	// initialize stored context
 	tsk = tls_sk(sk);
 
+	tsk->tls = (sock->type == SOCK_STREAM);
 	tsk->iv_send = NULL;
 	memset(&tsk->key_send, 0, sizeof(tsk->key_send));
 
@@ -1683,6 +1717,8 @@ static int tls_create(struct net *net,
 	sg_mark_end(&tsk->sendpage_ctx.sg[0]);
 
 	mutex_init(&tsk->rx_lock);
+
+	tsk->opts = protocol;
 
 	tsk->pages_send = tsk->pages_recv = tsk->pages_work = NULL;
 
@@ -1715,7 +1751,8 @@ static int tls_create(struct net *net,
 		tsk->vec_send[i].iov_len = tsk->sg_tx_data[i].length;
 	}
 
-	memset(&tsk->sgl_send, 0, sizeof(tsk->sgl_send));
+	for (i = 0; i < UIO_MAXIOV; i++)
+		memset(&tsk->sgl_send[i], 0, sizeof(tsk->sgl_send[i]));
 	sg_init_table(tsk->sgaad_send, 2);
 	sg_init_table(tsk->sgtag_send, 2);
 
@@ -1724,7 +1761,7 @@ static int tls_create(struct net *net,
 	sg_set_buf(&tsk->sgtag_send[0], tsk->tag_send, sizeof(tsk->tag_send));
 
 	sg_unmark_end(&tsk->sgaad_send[1]);
-	sg_chain(tsk->sgaad_send, 2, tsk->sgl_send.sg);
+	sg_chain(tsk->sgaad_send, 2, tsk->sgl_send[0].sg);
 
 	/*
 	 * Preallocation for receiving
@@ -1757,7 +1794,8 @@ static int tls_create(struct net *net,
 		tsk->vec_recv[i].iov_len = tsk->sg_rx_data[i].length;
 	}
 
-	memset(&tsk->sgl_recv, 0, sizeof(tsk->sgl_recv));
+	for (i = 0; i < UIO_MAXIOV; i++)
+		memset(&tsk->sgl_recv[i], 0, sizeof(tsk->sgl_recv[i]));
 	sg_init_table(tsk->sgaad_recv, 2);
 	sg_init_table(tsk->sgtag_recv, 2);
 
@@ -1766,7 +1804,7 @@ static int tls_create(struct net *net,
 	sg_set_buf(&tsk->sgtag_recv[0], tsk->tag_recv, sizeof(tsk->tag_recv));
 
 	sg_unmark_end(&tsk->sgaad_recv[1]);
-	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv.sg);
+	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv[0].sg);
 
 	// preallocation for asynchronous worker, where decrypted data are stored
 	sg_init_table(tsk->sg_rx_async_work, KTLS_SG_DATA_SIZE);
