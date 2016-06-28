@@ -1317,6 +1317,55 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 	return ret;
 }
 
+static unsigned int tls_poll(struct file *file, struct socket *sock,
+              struct poll_table_struct *wait) {
+
+	unsigned int ret;
+	struct tls_sock *tsk;
+	unsigned int mask;
+	struct sock *sk;
+
+	sk = sock->sk;
+	tsk = tls_sk(sock->sk);
+
+	//Call POLL on the underlying socket, which will call sock_poll_wait
+	//on underlying socket. Used for POLLOUT and POLLHUP
+	//TODO: Should we be passing underlying socket file in?
+	ret = tsk->socket->ops->poll(tsk->socket->file, tsk->socket, wait);
+
+	/*
+	 * Clear POLLIN bits. Data available in the underlying socket is not
+	 * necessarily ready to be read. The data could still be in the process
+	 * of decryption, or it could be meant for original fd.
+	 */
+	ret &= ~(POLLIN | POLLRDNORM);
+
+	/*
+	 * Used for POLLIN
+	 * Call generic POLL on TLS socket, which works for any sockets provided
+	 * the socket receive queue is only ever holding data ready to receive.
+	 * Data ready to be read are stored in KTLS's sk_receive_queue
+	 */
+	mask = datagram_poll(file, sock, wait);
+
+	/*
+	 * Clear POLLOUT and POLLHUPbits. Even if KTLS is ready to send, data won't be sent
+	 * if the underlying socket is not ready. in addition, even if KTLS was initialized
+	 * as a stream socket, it's not actually connected to anything, so we ignore its
+	 * POLLHUP. Also, we don't support priority band writes in KTLS
+	 */
+	mask &= ~(POLLOUT | POLLWRNORM | POLLHUP);
+
+	ret |= mask;
+
+	/*
+	 * POLLERR should return if either socket is received error.
+	 * We don't support high-priority data atm, so clear those bits
+	 */
+	ret &= ~(POLLWRBAND | POLLRDBAND);
+	return ret;
+}
+
 static struct sk_buff *tls_wait_data(struct tls_sock *tsk, int flags,
 				     long timeo, int *err)
 {
@@ -1408,7 +1457,7 @@ static int tls_recvmsg(struct socket *sock,
 			kfree_skb(skb);
 		}
 	}
-
+	ret = copied;
 recv_end:
 
 	release_sock(sock->sk);
@@ -1644,7 +1693,7 @@ static const struct proto_ops tls_proto_ops = {
 	.listen		=	sock_no_listen,
 	.shutdown	=	sock_no_shutdown,
 	.mmap		=	sock_no_mmap,
-	.poll		=	sock_no_poll,
+	.poll		=	tls_poll,
 	.accept		=	sock_no_accept,
 
 	.bind		=	tls_bind,
