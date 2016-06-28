@@ -676,7 +676,7 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 		if (ret < 0)
 			break;
 
-		sock_queue_rcv_skb((struct sock *)tsk, skb);
+		sock_queue_rcv_skb((struct sock *)tsk, head);
 	}
 	if (cloned_orig)
 		kfree_skb(orig_skb);
@@ -1654,7 +1654,7 @@ static const struct proto_ops tls_proto_ops = {
 	.recvmsg	=	tls_recvmsg,
 	.sendpage	=	tls_sendpage,
 	.release	=	tls_release,
-	.splice_read =	tls_splice_read,
+	.splice_read    =	tls_splice_read,
 };
 
 static void tls_sock_destruct(struct sock *sk)
@@ -1757,8 +1757,6 @@ static int tls_create(struct net *net,
 	 * Use maximum MTU by default
 	 */
 	tsk->mtu_payload = KTLS_MAX_PAYLOAD_SIZE;
-
-	//DTLS_WINDOW_INIT(tsk->dtls_window);
 
 	sg_init_table(tsk->sendpage_ctx.sg, KTLS_SG_DATA_SIZE);
 	sg_mark_end(&tsk->sendpage_ctx.sg[0]);
