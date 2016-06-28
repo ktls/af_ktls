@@ -25,6 +25,8 @@
 #include <linux/module.h>
 #include <linux/net.h>
 #include <net/sock.h>
+#include <net/tcp.h>
+#include <linux/skbuff.h>
 
 #include "af_ktls.h"
 
@@ -129,12 +131,6 @@
 						(KTLS_TLS_NONCE_OFFSET) : \
 						(KTLS_DTLS_NONCE_OFFSET))
 
-/*
- * Asynchrous receive handling
- */
-#define TLS_CACHE_DISCARD(T)		(T->recv_occupied = 0)
-#define TLS_CACHE_SIZE(T)		(T->recv_occupied)
-#define TLS_CACHE_SET_SIZE(T, S)	(T->recv_occupied = S)
 
 //#define KTLS_DEBUG
 
@@ -180,6 +176,13 @@ struct tls_key {
 	size_t saltlen;
 };
 
+struct tls_rx_msg {
+	int full_len;
+	int accum_len;
+	int offset;
+	int early_eaten;
+};
+
 struct tls_sock {
 	/* struct sock must be the very first member */
 	struct sock sk;
@@ -216,29 +219,19 @@ struct tls_sock {
 	struct scatterlist sgaad_send[2];
 	struct scatterlist sgtag_send[2];
 
-	/*
-	 * Receiving context, rx_lock has to be acquired before socket lock to
-	 * avoid deadlock
-	 */
-	struct mutex rx_lock;
-	struct scatterlist sg_rx_data[KTLS_SG_DATA_SIZE];
-	struct kvec vec_recv[KTLS_VEC_SIZE];
-	char header_recv[MAX(KTLS_TLS_PREPEND_SIZE, KTLS_DTLS_PREPEND_SIZE)];
+	/* Receive */
+	struct sk_buff *rx_skb_head;
+	struct sk_buff **rx_skb_nextp;
+	unsigned int rx_need_bytes;
+	struct scatterlist sgin[ALG_MAX_PAGES+1];
 	char aad_recv[KTLS_AAD_SPACE_SIZE];
-	char tag_recv[KTLS_TAG_SIZE];
-	struct page *pages_recv;
-	struct af_alg_sgl sgl_recv[UIO_MAXIOV];
-	struct scatterlist sgaad_recv[2];
-	struct scatterlist sgtag_recv[2];
+	char header_recv[MAX(KTLS_TLS_PREPEND_SIZE, KTLS_DTLS_PREPEND_SIZE)];
 
 	/*
 	 * Asynchronous work to cache one record
 	 */
 	struct work_struct recv_work;
 	void (*saved_sk_data_ready)(struct sock *sk);
-	struct scatterlist sg_rx_async_work[KTLS_SG_DATA_SIZE];
-	struct page *pages_work;
-	size_t recv_occupied;
 
 	/*
 	 * our cipher type and its crypto API representation (e.g. "gcm(aes)")
@@ -281,10 +274,29 @@ struct tls_sock {
 	unsigned parallel_count_stat;
 };
 
+
+static inline struct tls_rx_msg *tls_rx_msg(struct sk_buff *skb)
+{
+	return (struct tls_rx_msg *)((void *)skb->cb +
+				     offsetof(struct qdisc_skb_cb, data));
+}
 static inline struct tls_sock *tls_sk(struct sock *sk)
 {
 	return (struct tls_sock *)sk;
 }
+
+static int tls_do_decryption(const struct tls_sock *tsk,
+		struct scatterlist *sgin,
+		struct scatterlist *sgout,
+		size_t data_len);
+
+static inline void tls_make_aad(struct tls_sock *tsk,
+		int recv,
+		char *buf,
+		size_t size,
+		char *nonce_explicit);
+
+static int tls_post_process(const struct tls_sock *tsk, struct sk_buff *skb);
 
 static void increment_seqno(char *s)
 {
@@ -362,10 +374,333 @@ static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
 	sg_mark_end(&sg[tsk->sendpage_ctx.used]);
 }
 
-#include "dtls-window.c"
+/*
+ * //Returns the length of the unencrypted message, plus overhead
+ * Note that this function also ppopulates tsk->header which is later
+ * used for decryption
+ */
+static inline ssize_t tls_read_size(struct tls_sock *tsk, struct sk_buff *skb)
+{
+	int ret;
+	size_t data_len = 0;
+	size_t datagram_len;
+	char *header;
+	struct tls_rx_msg *rxm;
+	xprintk("--> %s", __FUNCTION__);
 
+	rxm = tls_rx_msg(skb);
+
+	//Copy header to use later in decryption.
+	//An optimization could be to zero-copy, but you'd
+	//have to be able to deal with frag_list bs. This function call
+	//takes care of that
+	//Overhead is relatively small (13 bytes ish)
+	if (skb_copy_bits(skb, rxm->offset, tsk->header_recv,
+			KTLS_TLS_PREPEND_SIZE) < 0) {
+		ret = -EFAULT;
+		goto read_failure;
+	}
+
+	header = tsk->header_recv;
+	// we handle only application data, let user space decide what
+	// to do otherwise
+	//
+	if (header[0] != KTLS_RECORD_DATA) {
+		ret = -EBADF;
+		goto read_failure;
+	}
+
+	if (IS_TLS(tsk)) {
+		data_len = ((header[4] & 0xFF) | (header[3] << 8));
+		data_len = data_len - KTLS_TAG_SIZE - KTLS_IV_SIZE;
+		datagram_len = data_len + KTLS_TLS_OVERHEAD;
+	} else {
+		//Don't support DTLS for now
+		ret = -EINVAL;
+	}
+
+	if (data_len > KTLS_MAX_PAYLOAD_SIZE) {
+		ret = -E2BIG;
+		goto read_failure;
+	}
+	return data_len + KTLS_TLS_OVERHEAD;
+
+read_failure:
+	return ret;
+}
+
+/* Lower socket lock held */
+/* Returns the number of bytes used */
+/* A lot of this code was copy/pasta from KCM code. Consider abstracting this */
+static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
+			unsigned int orig_offset, size_t orig_len)
+{
+	struct tls_sock *tsk = (struct tls_sock *)desc->arg.data;
+
+	struct tls_rx_msg *rxm;
+	struct sk_buff *head, *skb;
+	size_t eaten = 0, uneaten;
+	ssize_t extra;
+	int err;
+	bool cloned_orig = false;
+
+	head = tsk->rx_skb_head;
+	if (head) {
+		/* We seem to be in the middle of a message */
+
+		rxm = tls_rx_msg(head);
+
+		if (unlikely(rxm->early_eaten)) {
+			/* Already some number of bytes on the receive sock
+			 * data saved in rx_skb_head, just indicate they
+			 * are consumed.
+			 */
+			eaten = orig_len <= rxm->early_eaten ?
+				orig_len : rxm->early_eaten;
+			rxm->early_eaten -= eaten;
+
+			return eaten;
+		}
+
+		if (unlikely(orig_offset)) {
+			/* Getting data with a non-zero offset when a message is
+			 * in progress is not expected. If it does happen, we
+			 * need to clone and pull since we can't deal with
+			 * offsets in the skbs for a message expect in the head.
+			 */
+			orig_skb = skb_clone(orig_skb, GFP_ATOMIC);
+			if (!orig_skb) {
+				desc->error = -ENOMEM;
+				return 0;
+			}
+			if (!pskb_pull(orig_skb, orig_offset)) {
+				kfree_skb(orig_skb);
+				desc->error = -ENOMEM;
+				return 0;
+			}
+			cloned_orig = true;
+			orig_offset = 0;
+		}
+
+		//We are appending to head. Unshare the frag list
+		if (!tsk->rx_skb_nextp) {
+			err = skb_unclone(head, GFP_ATOMIC);
+			if (err) {
+				desc->error = err;
+				return 0;
+			}
+
+			if (unlikely(skb_shinfo(head)->frag_list)) {
+				/* We can't append to an sk_buff that already
+				 * has a frag_list. We create a new head, point
+				 * the frag_list of that to the old head, and
+				 * then are able to use the old head->next for
+				 * appending to the message.
+				 */
+				if (WARN_ON(head->next)) {
+					desc->error = -EINVAL;
+					return 0;
+				}
+
+				skb = alloc_skb(0, GFP_ATOMIC);
+				if (!skb) {
+					desc->error = -ENOMEM;
+					return 0;
+				}
+				skb->len = head->len;
+				skb->data_len = head->len;
+				skb->truesize = head->truesize;
+				*tls_rx_msg(skb) = *tls_rx_msg(head);
+				tsk->rx_skb_nextp = &head->next;
+				skb_shinfo(skb)->frag_list = head;
+				tsk->rx_skb_head = skb;
+				head = skb;
+			} else {
+				tsk->rx_skb_nextp =
+				    &skb_shinfo(head)->frag_list;
+			}
+		}
+	}
+
+	while (eaten < orig_len) {
+		int ret;
+		int nsg;
+		/* Always clone since we will consume something */
+
+		//GFP_ATOMIC since we are holding a lock
+		skb = skb_clone(orig_skb, GFP_ATOMIC);
+		if (!skb) {
+			desc->error = -ENOMEM;
+			break;
+		}
+
+		uneaten = orig_len - eaten;
+
+		head = tsk->rx_skb_head;
+		//head is null
+		if (!head) {
+			head = skb;
+			tsk->rx_skb_head = head;
+			/* Will set rx_skb_nextp on next packet if needed */
+			tsk->rx_skb_nextp = NULL;
+			rxm = tls_rx_msg(head);
+			memset(rxm, 0, sizeof(*rxm));
+			rxm->offset = orig_offset + eaten;
+		} else {
+			//head not null
+			/* Unclone since we may be appending to an skb that we
+			 * already share a frag_list with.
+			 */
+			err = skb_unclone(skb, GFP_ATOMIC);
+			if (err) {
+				desc->error = err;
+				break;
+			}
+
+			rxm = tls_rx_msg(head);
+			*tsk->rx_skb_nextp = skb;
+			tsk->rx_skb_nextp = &skb->next;
+			head->data_len += skb->len;
+			head->len += skb->len;
+			head->truesize += skb->truesize;
+		}
+
+		if (!rxm->full_len) {
+			ssize_t len;
+
+			len = tls_read_size(tsk, head);
+
+			if (!len) {
+				/* Need more header to determine length */
+
+				rxm->accum_len += uneaten;
+				eaten += uneaten;
+				WARN_ON(eaten != orig_len);
+				break;
+			} else if (len > tsk->socket->sk->sk_rcvbuf) {
+				/* Message length exceeds maximum allowed */
+				desc->error = -EMSGSIZE;
+				tsk->rx_skb_head = NULL;
+				//kcm_abort_rx_tsk(tsk, EMSGSIZE, head);
+				break;
+			} else if (len <= (ssize_t)head->len -
+					  skb->len - rxm->offset) {
+				/* Length must be into new skb (and also
+				 * greater than zero)
+				 */
+				desc->error = -EPROTO;
+				tsk->rx_skb_head = NULL;
+				//kcm_abort_rx_tsk(tsk, EPROTO, head);
+				break;
+			}
+
+			rxm->full_len = len;
+		}
+
+		extra = (ssize_t)(rxm->accum_len + uneaten) - rxm->full_len;
+
+		if (extra < 0) {
+			/* Message not complete yet. */
+			if (rxm->full_len - rxm->accum_len >
+			    tcp_inq((struct sock *)tsk)) {
+				/* Don't have the whole messages in the socket
+				 * buffer. Set tsk->rx_need_bytes to wait for
+				 * the rest of the message. Also, set "early
+				 * eaten" since we've already buffered the skb
+				 * but don't consume yet per tcp_read_sock.
+				 * If function returns 0, does not consume
+				 */
+
+				/* Wait. Why doesn't this code path just set
+				 * eaten? Then tcp_read_sock will eat and profit!
+				 */
+				if (!rxm->accum_len) {
+					/* Start RX timer for new message */
+					//kcm_start_rx_timer(tsk);
+				}
+
+				tsk->rx_need_bytes = rxm->full_len -
+						       rxm->accum_len;
+				rxm->accum_len += uneaten;
+				rxm->early_eaten = uneaten;
+				desc->count = 0; /* Stop reading socket */
+				break;
+			}
+			rxm->accum_len += uneaten;
+			eaten += uneaten;
+			WARN_ON(eaten != orig_len);
+			break;
+		}
+
+		/* Positive extra indicates ore bytes than needed for the
+		 * message
+		 */
+
+		WARN_ON(extra > uneaten);
+
+		eaten += (uneaten - extra);
+
+		/* Hurray, we have a new message! */
+		tsk->rx_skb_head = NULL;
+
+		/*
+		 * Possible security vulnerability since skb can require
+		 * more than ALG_MAX_PAGES sg's.
+		 * TODO: So what exactly happens if skb_to_sgvec causes more than ALG_MAX_PAGES
+		 * fragments? Consider allocating kernel pages
+		 * tls_read_size already copied headers and aad. Therefore this simply needs to
+		 * pass the encrypted data + message
+		 */
+		nsg = skb_to_sgvec(head, &tsk->sgin[1], rxm->offset + KTLS_TLS_PREPEND_SIZE,
+				rxm->full_len - KTLS_TLS_PREPEND_SIZE);
+		tls_make_aad(tsk, 1, tsk->aad_recv, rxm->full_len - KTLS_TLS_OVERHEAD,
+			     tsk->iv_recv);
+
+		/*
+		 * Decrypt in place.
+		 * After this function call, the decrypted data will be in rxm->offset.
+		 * We must therefore account for the fact that the lengths
+		 * of skbuff_in and skbuff_out are different
+		 */
+
+		ret = tls_do_decryption(tsk,
+				tsk->sgin,
+				tsk->sgin,
+				rxm->full_len - KTLS_TLS_OVERHEAD);
+
+		if (ret < 0)
+			break;
+
+		ret = tls_post_process(tsk, head);
+
+		if (ret < 0)
+			break;
+
+		sock_queue_rcv_skb((struct sock *)tsk, skb);
+	}
+	if (cloned_orig)
+		kfree_skb(orig_skb);
+
+	return eaten;
+}
+
+static int tls_tcp_read_sock(struct tls_sock *tsk)
+{
+	read_descriptor_t desc;
+
+	desc.arg.data = tsk;
+	desc.error = 0;
+	desc.count = 1; /* give more than one skb per call */
+
+	/* sk should be locked here, so okay to do tcp_read_sock */
+	tcp_read_sock(tsk->socket->sk, &desc, tls_tcp_recv);
+
+	return desc.error;
+}
+// Called with lower socket held
 static void tls_data_ready(struct sock *sk)
 {
+
 	struct tls_sock *tsk;
 
 	xprintk("--> %s", __FUNCTION__);
@@ -376,10 +711,54 @@ static void tls_data_ready(struct sock *sk)
 	if (unlikely(!tsk || tsk->rx_stopped)) {
 		goto out;
 	}
-	queue_work(tls_wq, &tsk->recv_work);
+
+	if (tsk->rx_need_bytes) {
+		if (tcp_inq(sk) >= tsk->rx_need_bytes)
+			tsk->rx_need_bytes = 0;
+		else
+			goto out;
+	}
+
+	if (tls_tcp_read_sock(tsk) == -ENOMEM)
+		queue_work(tls_wq, &tsk->recv_work);
+		//queue_delayed_work(tls_wq, &tsk->recv_work, 0);
 
   out:
 	read_unlock_bh(&sk->sk_callback_lock);
+}
+
+static void do_tls_sock_rx_work(struct tls_sock *tsk)
+{
+	read_descriptor_t rd_desc;
+	struct sock *sk = tsk->socket->sk;
+
+	/* We need the read lock to synchronize with tls_sock_tcp_data_ready. We
+	 * need the socket lock for calling tcp_read_sock.
+	 */
+	lock_sock(sk);
+	read_lock_bh(&sk->sk_callback_lock);
+
+	if (unlikely(sk->sk_user_data != tsk))
+		goto out;
+
+	if (unlikely(tsk->rx_stopped))
+		goto out;
+
+
+	rd_desc.arg.data = tsk;
+
+	if (tls_tcp_read_sock(tsk) == -ENOMEM)
+		queue_work(tls_wq, &tsk->recv_work);
+		//queue_delayed_work(tls_wq, &tsk->recv_work, 0);
+
+out:
+	read_unlock_bh(&sk->sk_callback_lock);
+	release_sock(sk);
+}
+
+static void tls_rx_work(struct work_struct *w)
+{
+	do_tls_sock_rx_work(container_of(w, struct tls_sock, recv_work));
 }
 
 static int tls_set_iv(struct socket *sock,
@@ -597,17 +976,6 @@ static int tls_setsockopt(struct socket *sock,
 		default:
 			break;
 	}
-
-	/*
-	 * We need to discard cache every time there is a change on socket
-	 * not to be in an invalid state
-	 */
-	TLS_CACHE_DISCARD(tsk);
-	/*
-	 * The same applies to DTLS window
-	 */
-	DTLS_WINDOW_INIT(tsk->dtls_window);
-
 	return ret < 0 ? ret : 0;
 }
 
@@ -806,26 +1174,6 @@ static inline void tls_make_aad(struct tls_sock *tsk,
 	buf[12] = size & 0xFF;
 }
 
-static inline void tls_pop_record(struct tls_sock *tsk, size_t data_len)
-{
-	int ret;
-	struct msghdr msg = {};
-
-	xprintk("--> %s", __FUNCTION__);
-
-	if (IS_TCP(tsk->socket)) {
-		ret = kernel_recvmsg(tsk->socket, &msg,
-				tsk->vec_recv, KTLS_VEC_SIZE,
-				KTLS_RECORD_SIZE(tsk, data_len), MSG_TRUNC);
-		WARN_ON(ret != KTLS_RECORD_SIZE(tsk, data_len));
-	} else { /* UDP */
-		ret = kernel_recvmsg(tsk->socket,
-				&msg, tsk->vec_recv, KTLS_VEC_SIZE,
-				/*size*/0, /*flags*/0);
-		WARN_ON(ret != 0);
-	}
-}
-
 static int tls_do_encryption(struct tls_sock *tsk,
 		struct scatterlist *sgin,
 		struct scatterlist *sgout,
@@ -848,6 +1196,7 @@ static int tls_do_encryption(struct tls_sock *tsk,
 			&completion);
 }
 
+//TODO: Avoid kernel_sendmsg
 static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 {
 	struct tls_sock *tsk;
@@ -938,327 +1287,87 @@ static int tls_do_decryption(const struct tls_sock *tsk,
 	return ret;
 }
 
-static int tls_post_process(const struct tls_sock *tsk, struct scatterlist *sgl)
+static int tls_post_process(const struct tls_sock *tsk, struct sk_buff *skb)
 {
-	/* Placeholder for future extensibility via BPF or something similar.
-	 * On several occasions we need to act based on the contents of the
-	 * decrypted data (e.g., give control directly to userspace with a special
-	 * error, etc). This will allow for protocols like Openconnect VPN to
-	 * use this framework and handle specially the packets which are not data.
-	 */
 
+	struct tls_rx_msg *rxm;
+	rxm = tls_rx_msg(skb);
+
+	/* The crypto API does the following transformation.
+	 * Before:
+	 *   AAD(13) | DATA | TAG
+	 * After:
+	 *   AAD(13) | DECRYPTED | TAG
+	 * The AAD and TAG is left untouched. However we don't want that
+	 * returned to the user. Therefore we fix the offsets and lengths
+	 */
+	rxm->offset += KTLS_TLS_PREPEND_SIZE;
+	rxm->full_len -= KTLS_TLS_OVERHEAD;
+	increment_seqno(tsk->iv_recv);
 	return 0;
 }
 
-static inline ssize_t tls_peek_data(struct tls_sock *tsk, unsigned flags)
-{
-	int ret;
-	ssize_t peeked_size;
-	size_t data_len = 0;
-	size_t datagram_len;
-	struct msghdr msg = {};
-	char *header;
-
-	xprintk("--> %s", __FUNCTION__);
-
-	/*
-	 * we need to peek first, so we know what will be received, we have to
-	 * handle DTLS window here as well, since this is the only function that
-	 * does actual recv
-	 */
-	do {
-		peeked_size = kernel_recvmsg(tsk->socket, &msg,
-				tsk->vec_recv, KTLS_VEC_SIZE,
-				KTLS_RECORD_SIZE(tsk, KTLS_MAX_PAYLOAD_SIZE),
-				MSG_PEEK | flags);
-
-		if (peeked_size < 0) {
-			ret = peeked_size;
-			goto peek_failure;
-		}
-
-		header = tsk->header_recv;
-		// we handle only application data, let user space decide what
-		// to do otherwise
-		//
-		if (header[0] != KTLS_RECORD_DATA) {
-			ret = -EBADF;
-			goto peek_failure;
-		}
-
-		if (IS_TLS(tsk)) {
-			data_len = ((header[4] & 0xFF) | (header[3] << 8));
-			data_len = data_len - KTLS_TAG_SIZE - KTLS_IV_SIZE;
-			datagram_len = data_len + KTLS_TLS_OVERHEAD;
-		} else {
-			data_len = ((header[12] & 0xFF) | (header[11] << 8));
-			data_len = data_len - KTLS_TAG_SIZE - KTLS_IV_SIZE;
-			datagram_len = data_len + KTLS_DTLS_OVERHEAD;
-		}
-
-		if (data_len > KTLS_MAX_PAYLOAD_SIZE) {
-			ret = -E2BIG;
-			goto peek_failure;
-		}
-
-		if (IS_TLS(tsk)) {
-			if (datagram_len > peeked_size) {
-				ret = -EFAULT; // TODO: consider returning ENOMEM
-				goto peek_failure;
-			}
-		} else {
-			if (datagram_len != peeked_size) {
-				ret = -EFAULT;
-				goto peek_failure;
-			}
-		}
-	} while (IS_DTLS(tsk) &&
-			!dtls_window(tsk, tsk->header_recv + KTLS_DTLS_SEQ_NUM_OFFSET));
-
-	return data_len;
-
-peek_failure:
-	return ret;
-}
-
-static void tls_rx_async_work(struct work_struct *w)
-{
-	int ret;
-	ssize_t data_len;
-	struct sock *sk;
-	struct tls_sock *tsk = container_of(w, struct tls_sock, recv_work);
-
-	sk = (struct sock*) tsk;
-
-	xprintk("--> %s", __FUNCTION__);
-
-	if (!KTLS_RECV_READY(tsk))
-		return;
-
-	if (mutex_trylock(&tsk->rx_lock)) {
-		lock_sock(sk);
-		read_lock_bh(&sk->sk_callback_lock);
-
-		if (!tsk->socket || tsk->rx_stopped) {
-			goto rx_work_end;
-		}
-
-		// already occupied?
-		if (TLS_CACHE_SIZE(tsk) != 0)
-			goto rx_work_end;
-
-		tsk->parallel_count_stat++; // TODO: remove
-
-		data_len = tls_peek_data(tsk, MSG_DONTWAIT);
-		// nothing to process (-EAGAIN) or other error? let user space
-		// ask for it (do not cache errors)
-		if (data_len <= 0)
-			goto rx_work_end;
-
-		tls_make_aad(tsk, 1, tsk->aad_recv, data_len,
-			     tsk->iv_recv);
-
-		ret = tls_do_decryption(tsk, tsk->sg_rx_data,
-				tsk->sg_rx_async_work, data_len);
-		if (ret < 0)
-			goto rx_work_end;
-
-		TLS_CACHE_SET_SIZE(tsk, data_len);
-
-rx_work_end:
-		read_unlock_bh(&sk->sk_callback_lock);
-		release_sock(sk);
-		mutex_unlock(&tsk->rx_lock);
-	} else {
-		// wake up rx queue
-		tsk->saved_sk_data_ready(tsk->socket->sk);
-	}
-}
-
-static const struct pipe_buf_operations tls_pipe_buf_ops = {
-	.can_merge		= 0,
-	.confirm		= generic_pipe_buf_confirm,
-	.release		= generic_pipe_buf_release,
-	.steal			= generic_pipe_buf_steal,
-	.get			= generic_pipe_buf_get,
-};
-
-static void tls_spd_release(struct splice_pipe_desc *spd, unsigned int i)
-{
-	put_page(spd->pages[i]);
-}
-
-static int tls_splice_read_alloc(struct splice_pipe_desc *spd,
-		size_t data_len) {
-	int ret;
-	size_t not_allocated, to_alloc;
-	size_t pages_needed, i, j;
-
-	pages_needed = data_len / PAGE_SIZE;
-	if (pages_needed * PAGE_SIZE < data_len)
-		pages_needed++;
-
-	not_allocated = data_len;
-	for (i = 0; i < pages_needed; i++) {
-		to_alloc = min_t(size_t, PAGE_SIZE, not_allocated);
-		spd->pages[i] = alloc_page(GFP_KERNEL);
-		if (!spd->pages[i]) {
-			for (j = 0; j < i; j++)
-				__free_page(spd->pages[j]);
-			ret = -ENOMEM;
-			goto splice_read_alloc_end;
-		}
-
-		spd->partial[i].len = to_alloc;
-		spd->partial[i].offset = 0;
-		spd->partial[i].private = 0;
-		not_allocated -= to_alloc;
-	}
-
-	spd->nr_pages = pages_needed;
-	spd->nr_pages_max = pages_needed;
-
-	ret = pages_needed;
-
-splice_read_alloc_end:
-	return ret;
-
-}
-
+//TODO: Don't support this for now.
 static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 				       struct pipe_inode_info *pipe,
 				       size_t size, unsigned int flags)
 {
 	ssize_t ret;
-	size_t copy;
-	size_t to_assign, assigned;
-	ssize_t data_len;
-	size_t i;
-	struct scatterlist sg[KTLS_DATA_PAGES + 1]; // +1 for chaining
-	struct tls_sock *tsk;
-	struct page *pages[KTLS_DATA_PAGES + 2]; // +1 for header, +1 for tag
-	struct partial_page partial[KTLS_DATA_PAGES + 2];
-	struct splice_pipe_desc spd = {
-		.pages          = pages,
-		.partial        = partial,
-		.nr_pages       = 0, // assigned bellow
-		.nr_pages_max   = 0, // assigned bellow
-		.flags          = flags, // TODO: handle, see issue #4
-		.ops            = &tls_pipe_buf_ops,
-		.spd_release    = tls_spd_release,
-	};
-
-	xprintk("--> %s", __FUNCTION__);
-
-	tsk = tls_sk(sock->sk);
-	mutex_lock(&tsk->rx_lock);
-	lock_sock(sock->sk);
-
-	if (!KTLS_RECV_READY(tsk)) {
-		ret = -EBADMSG;
-		goto splice_read_end;
-	}
-
-	if (TLS_CACHE_SIZE(tsk) > 0) { // we already received asynchronously
-		data_len = TLS_CACHE_SIZE(tsk);
-
-		ret = tls_splice_read_alloc(&spd, data_len);
-		if (ret < 0)
-			goto splice_read_end;
-
-		for (i = 0; data_len; i++) {
-			copy = min_t(size_t,
-					tsk->sg_rx_async_work[i + 1].length,
-					data_len);
-			memcpy(page_address(spd.pages[i]),
-				page_address(sg_page(tsk->sg_rx_async_work + i + 1)),
-				copy);
-
-			spd.partial[i].len = copy;
-			spd.partial[i].offset = 0;
-			spd.partial[i].private = 0;
-			data_len -= copy;
-		}
-		data_len = TLS_CACHE_SIZE(tsk);
-
-		ret = splice_to_pipe(pipe, &spd);
-
-		if (ret > 0)
-			TLS_CACHE_DISCARD(tsk);
-	} else {
-		data_len = tls_peek_data(tsk, 0);
-
-		if (data_len < 0) {
-			ret = data_len;
-			goto splice_read_end;
-		}
-
-		if (data_len > size) {
-			ret = -E2BIG;
-			goto splice_read_end;
-		}
-
-		ret = tls_splice_read_alloc(&spd, data_len);
-		if (ret < 0)
-			goto splice_read_end;
-
-		// assign to sg, so we can do decryption
-		sg_init_table(sg, ret + 1);
-		to_assign = data_len;
-		for (i = 0; to_assign; i ++) {
-			assigned = min_t(size_t, PAGE_SIZE, to_assign);
-			sg_set_page(sg + i, spd.pages[i], assigned, 0);
-			to_assign -= assigned;
-		}
-		sg_chain(tsk->sgaad_recv, 2, sg);
-		sg_unmark_end(&sg[ret - 1]);
-		sg_chain(sg, ret + 1, tsk->sgtag_recv);
-
-		tls_make_aad(tsk, 1, tsk->aad_recv, data_len,
-			     tsk->iv_recv);
-
-		ret = tls_do_decryption(tsk, tsk->sg_rx_data,
-				tsk->sgaad_recv, data_len);
-		if (ret < 0)
-			goto splice_read_end;
-
-		ret = splice_to_pipe(pipe, &spd);
-	}
-
-	if (ret > 0) {
-		increment_seqno(tsk->iv_recv);
-		tls_pop_record(tsk, data_len);
-	}
-
-splice_read_end:
-	// restore chaining for receiving
-	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv[0].sg);
-
-	if (ret > 0)
-		queue_work(tls_wq, &tsk->recv_work);
-
-	release_sock(sock->sk);
-	mutex_unlock(&tsk->rx_lock);
-
+	ret = -EOPNOTSUPP;
 	return ret;
 }
 
+static struct sk_buff *tls_wait_data(struct tls_sock *tsk, int flags,
+				     long timeo, int *err)
+{
+	struct sk_buff *skb;
+	struct sock *sk;
+
+	sk = (struct sock *)tsk;
+
+	while (!(skb = skb_peek(&sk->sk_receive_queue))) {
+		if (sk->sk_err) {
+			*err = sock_error(sk);
+			return NULL;
+		}
+
+		if (sock_flag(sk, SOCK_DONE))
+			return NULL;
+
+		if ((flags & MSG_DONTWAIT) || !timeo) {
+			*err = -EAGAIN;
+			return NULL;
+		}
+
+		sk_wait_data(sk, &timeo, NULL);
+
+		/* Handle signals */
+		if (signal_pending(current)) {
+			*err = sock_intr_errno(timeo);
+			return NULL;
+		}
+	}
+
+	return skb;
+}
+
+//TODO: Implement TCP (stream-like) behavior
 static int tls_recvmsg(struct socket *sock,
 		struct msghdr *msg,
-		size_t size,
+		size_t len,
 		int flags)
 {
-	int i;
-	size_t copy, copied;
-	ssize_t data_len;
+	ssize_t copied = 0;
+	int err = 0;
+	long timeo;
 	struct tls_sock *tsk;
+	struct tls_rx_msg *rxm;
 	int ret = 0;
-	unsigned int cnt = 0;
+	struct sk_buff *skb;
 
 	xprintk("--> %s", __FUNCTION__);
 
 	tsk = tls_sk(sock->sk);
-	mutex_lock(&tsk->rx_lock);
 	lock_sock(sock->sk);
 
 	if (!KTLS_RECV_READY(tsk)) {
@@ -1266,87 +1375,43 @@ static int tls_recvmsg(struct socket *sock,
 		goto recv_end;
 	}
 
-	// TODO: handle flags, see issue #4
+	timeo = sock_rcvtimeo(&tsk->sk, flags & MSG_DONTWAIT);
 
-	if (TLS_CACHE_SIZE(tsk) > 0) {
-		if (size < TLS_CACHE_SIZE(tsk)) {
-			ret = -ENOMEM;
-			goto recv_end;
-		}
+	//Consider helping with decryption
+	skb = tls_wait_data(tsk, flags, timeo, &err);
+	if (!skb)
+		goto recv_end;
+	rxm = tls_rx_msg(skb);
 
-		data_len = TLS_CACHE_SIZE(tsk);
-		for (i = 1; data_len; i++) {
-			copy = min_t(size_t,
-					tsk->sg_rx_async_work[i].length,
-					data_len);
-			copied = copy_page_to_iter(sg_page(tsk->sg_rx_async_work + i),
-							tsk->sg_rx_async_work[i].offset,
-							copy,
-							&msg->msg_iter);
-			if (copied < copy) {
-				ret = -EFAULT;
-				goto recv_end;
+	if (len > rxm->full_len)
+		len = rxm->full_len;
+
+	err = skb_copy_datagram_msg(skb, rxm->offset, msg, len);
+	if (err < 0)
+		goto recv_end;
+
+	copied = len;
+	if (likely(!(flags & MSG_PEEK))) {
+		if (copied < rxm->full_len) {
+			if (IS_DTLS(tsk)) {
+				/* Truncated message */
+				msg->msg_flags |= MSG_TRUNC;
+				goto msg_finished;
 			}
-
-			data_len -= copied;
+			rxm->offset += copied;
+			rxm->full_len -= copied;
+		} else {
+			msg_finished:
+			/* Finished with message */
+			msg->msg_flags |= MSG_EOR;
+			skb_unlink(skb, &((struct sock *)tsk)->sk_receive_queue);
+			kfree_skb(skb);
 		}
-
-		ret = TLS_CACHE_SIZE(tsk);
-		TLS_CACHE_DISCARD(tsk);
-	} else {
-		while (iov_iter_count(&msg->msg_iter)) {
-			size_t seglen = iov_iter_count(&msg->msg_iter);
-			int len = af_alg_make_sg(&tsk->sgl_recv[cnt], &msg->msg_iter, seglen);
-			if (len < 0)
-				goto recv_end;
-			ret += len;
-			if (cnt)
-				af_alg_link_sg(&tsk->sgl_recv[cnt-1], &tsk->sgl_recv[cnt]);
-			iov_iter_advance(&msg->msg_iter, len);
-			cnt++;
-		}
-		sg_unmark_end(&tsk->sgl_recv[cnt-1].sg[tsk->sgl_recv[cnt-1].npages - 1]);
-		sg_chain(tsk->sgl_recv[cnt-1].sg, tsk->sgl_recv[cnt-1].npages + 1, tsk->sgtag_recv);
-
-		data_len = tls_peek_data(tsk, 0);
-
-		if (data_len < 0) {
-			ret = data_len;
-			goto recv_end;
-		}
-
-		if (size < data_len) {
-			ret = -ENOMEM;
-			goto recv_end;
-		}
-
-		tls_make_aad(tsk, 1, tsk->aad_recv, data_len,
-			     tsk->iv_recv);
-
-		ret = tls_do_decryption(tsk,
-				tsk->sg_rx_data,
-				tsk->sgaad_recv,
-				data_len);
-		if (ret < 0)
-			goto recv_end;
-
-		ret = tls_post_process(tsk, tsk->sgaad_recv);
-		if (ret < 0)
-			goto recv_end;
-
-		ret = data_len;
 	}
 
-	tls_pop_record(tsk, ret);
-	increment_seqno(tsk->iv_recv);
-
 recv_end:
-	if (ret > 0)
-		queue_work(tls_wq, &tsk->recv_work);
-	for (i = 0; i < cnt; i++)
-		af_alg_free_sg(&tsk->sgl_recv[i]);
+
 	release_sock(sock->sk);
-	mutex_unlock(&tsk->rx_lock);
 
 	return ret;
 }
@@ -1638,10 +1703,6 @@ static void tls_sock_destruct(struct sock *sk)
 
 	if (tsk->pages_send)
 		__free_pages(tsk->pages_send, KTLS_DATA_PAGES);
-	if (tsk->pages_recv)
-		__free_pages(tsk->pages_recv, KTLS_DATA_PAGES);
-	if (tsk->pages_work)
-		__free_pages(tsk->pages_work, KTLS_DATA_PAGES);
 }
 
 static struct proto tls_proto = {
@@ -1697,14 +1758,12 @@ static int tls_create(struct net *net,
 	 */
 	tsk->mtu_payload = KTLS_MAX_PAYLOAD_SIZE;
 
-	DTLS_WINDOW_INIT(tsk->dtls_window);
+	//DTLS_WINDOW_INIT(tsk->dtls_window);
 
 	sg_init_table(tsk->sendpage_ctx.sg, KTLS_SG_DATA_SIZE);
 	sg_mark_end(&tsk->sendpage_ctx.sg[0]);
 
-	mutex_init(&tsk->rx_lock);
-
-	tsk->pages_send = tsk->pages_recv = tsk->pages_work = NULL;
+	tsk->pages_send = NULL;
 
 	ret = -ENOMEM;
 	/*
@@ -1747,62 +1806,9 @@ static int tls_create(struct net *net,
 	sg_unmark_end(&tsk->sgaad_send[1]);
 	sg_chain(tsk->sgaad_send, 2, tsk->sgl_send[0].sg);
 
-	/*
-	 * Preallocation for receiving
-	 *   scatterlist: AAD | data | TAG
-	 *	 (for crypto AAD, aad and TAG are untouched)
-	 *   vec: HEADER | data | TAG
-	 *   async vec: HEADER| data | TAG
-	 *
-	 * for the async vec HEADER and TAG are reused, but chaining after async
-	 * operation has to be restored
-	 */
-	sg_init_table(tsk->sg_rx_data, KTLS_SG_DATA_SIZE);
-	sg_set_buf(&tsk->sg_rx_data[0], tsk->aad_recv, sizeof(tsk->aad_recv));
-	tsk->pages_recv = alloc_pages(GFP_KERNEL, KTLS_DATA_PAGES);
-	if (!tsk->pages_recv)
-		goto create_error;
-	for (i = 0; i < KTLS_DATA_PAGES; i++)
-		// the first is HEADER
-		sg_set_page(tsk->sg_rx_data + i + 1, tsk->pages_recv + i, PAGE_SIZE, 0);
-	sg_set_buf(tsk->sg_rx_data + KTLS_SG_DATA_SIZE - 2,
-			tsk->tag_recv, sizeof(tsk->tag_recv));
-	sg_mark_end(tsk->sg_rx_data + KTLS_SG_DATA_SIZE - 1);
-
-	// msg for receiving
-	tsk->vec_recv[0].iov_base = tsk->header_recv;
-	tsk->vec_recv[0].iov_len = IS_TLS(tsk) ?
-			KTLS_TLS_PREPEND_SIZE : KTLS_DTLS_PREPEND_SIZE;
-	for (i = 1; i <= KTLS_DATA_PAGES + 1; i++) {
-		tsk->vec_recv[i].iov_base = page_address(sg_page(tsk->sg_rx_data + i)) + tsk->sg_rx_data[i].offset;
-		tsk->vec_recv[i].iov_len = tsk->sg_rx_data[i].length;
-	}
-
-	for (i = 0; i < UIO_MAXIOV; i++)
-		memset(&tsk->sgl_recv[i], 0, sizeof(tsk->sgl_recv[i]));
-	sg_init_table(tsk->sgaad_recv, 2);
-	sg_init_table(tsk->sgtag_recv, 2);
-
-	sg_set_buf(&tsk->sgaad_recv[0], tsk->aad_recv, sizeof(tsk->aad_recv));
-	// chaining to tag is performed on actual data size when receiving
-	sg_set_buf(&tsk->sgtag_recv[0], tsk->tag_recv, sizeof(tsk->tag_recv));
-
-	sg_unmark_end(&tsk->sgaad_recv[1]);
-	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv[0].sg);
-
-	// preallocation for asynchronous worker, where decrypted data are stored
-	sg_init_table(tsk->sg_rx_async_work, KTLS_SG_DATA_SIZE);
-	sg_set_buf(&tsk->sg_rx_async_work[0], tsk->aad_recv, sizeof(tsk->aad_recv));
-	tsk->pages_work = alloc_pages(GFP_KERNEL, KTLS_DATA_PAGES);
-	for (i = 0; i < KTLS_DATA_PAGES; i++)
-		// the first is HEADER
-		sg_set_page(tsk->sg_rx_async_work + i + 1, tsk->pages_work + i, PAGE_SIZE, 0);
-	sg_set_buf(tsk->sg_rx_async_work + KTLS_SG_DATA_SIZE - 2,
-			tsk->tag_recv,
-			sizeof(tsk->tag_recv));
-	sg_mark_end(tsk->sg_rx_async_work + KTLS_SG_DATA_SIZE - 1);
-
-	INIT_WORK(&tsk->recv_work, tls_rx_async_work);
+	sg_init_table(tsk->sgin, sizeof(tsk->sgin)/sizeof(tsk->sgin[0]));
+	sg_set_buf(&tsk->sgin[0], tsk->aad_recv, sizeof(tsk->aad_recv));
+	INIT_WORK(&tsk->recv_work, tls_rx_work);
 
 	return 0;
 
