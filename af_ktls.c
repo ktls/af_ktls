@@ -228,7 +228,7 @@ struct tls_sock {
 	char header_recv[MAX(KTLS_TLS_PREPEND_SIZE, KTLS_DTLS_PREPEND_SIZE)];
 
 	/*
-	 * Asynchronous work to cache one record
+	 * Asynchronous work in case of low memory
 	 */
 	struct work_struct recv_work;
 	void (*saved_sk_data_ready)(struct sock *sk);
@@ -377,18 +377,8 @@ static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
 //Must be called with socket callback locked
 static void tls_unattach(struct tls_sock *tsk)
 {
-	return;
 	tsk->socket->sk->sk_data_ready = tsk->saved_sk_data_ready;
 	tsk->socket->sk->sk_user_data = NULL;
-	if (tsk->aead_send) {
-		crypto_free_aead(tsk->aead_send);
-		tsk->aead_send = NULL;
-	}
-	if (tsk->aead_recv) {
-		crypto_free_aead(tsk->aead_recv);
-		tsk->aead_recv = NULL;
-	}
-
 }
 
 /*
@@ -557,8 +547,8 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 		int nsg;
 		/* Always clone since we will consume something */
 
-		//GFP_ATOMIC since we are holding a lock
-		skb = skb_clone(orig_skb, GFP_ATOMIC);
+		//GFP_ATOMIC since we may be in softirq
+		skb = skb_copy(orig_skb, GFP_ATOMIC);
 		if (!skb) {
 			desc->error = -ENOMEM;
 			break;
@@ -578,14 +568,6 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 			rxm->offset = orig_offset + eaten;
 		} else {
 			//head not null
-			/* Unclone since we may be appending to an skb that we
-			 * already share a frag_list with.
-			 */
-			err = skb_unclone(skb, GFP_ATOMIC);
-			if (err) {
-				desc->error = err;
-				break;
-			}
 
 			rxm = tls_rx_msg(head);
 			*tsk->rx_skb_nextp = skb;
@@ -719,6 +701,7 @@ decryption_fail:
 	tsk->rx_skb_head = NULL;
 	desc->count = 0;
 	tsk->rx_stopped = 1;
+	((struct sock *)tsk)->sk_err = -EBADMSG;
 	goto done;
 }
 
@@ -805,7 +788,6 @@ static void do_tls_sock_rx_work(struct tls_sock *tsk)
 
 	else if (ret == -EBADMSG) {
 		tsk->saved_sk_data_ready(tsk->socket->sk);
-		//TODO: Socket error
 		tls_unattach(tsk);
 	}
 
@@ -1434,8 +1416,9 @@ static struct sk_buff *tls_wait_data(struct tls_sock *tsk, int flags,
 	sk = (struct sock *)tsk;
 
 	while (!(skb = skb_peek(&sk->sk_receive_queue))) {
+		/* Don't clear sk_err since recvmsg may not return it immediately */
 		if (sk->sk_err) {
-			*err = sock_error(sk);
+			*err = sk->sk_err;
 			return NULL;
 		}
 
@@ -1485,45 +1468,37 @@ static int tls_recvmsg(struct socket *sock,
 
 	timeo = sock_rcvtimeo(&tsk->sk, flags & MSG_DONTWAIT);
 
-	//TODO: Consider helping with decryption
-	skb = tls_wait_data(tsk, flags, timeo, &err);
-	if (!skb) {
-		ret = err;
-		goto recv_end;
-	}
-
-	rxm = tls_rx_msg(skb);
-
-	if (len > rxm->full_len)
-		len = rxm->full_len;
-
-	err = skb_copy_datagram_msg(skb, rxm->offset, msg, len);
-	if (err < 0)
-		goto recv_end;
-
-	copied = len;
-	if (likely(!(flags & MSG_PEEK))) {
-		if (copied < rxm->full_len) {
-			if (IS_DTLS(tsk)) {
-				/* Truncated message */
-				msg->msg_flags |= MSG_TRUNC;
-				goto msg_finished;
+	do {
+		int chunk;
+		//TODO: Consider helping with decryption
+		skb = tls_wait_data(tsk, flags, timeo, &err);
+		if (!skb)
+			goto recv_end;
+		rxm = tls_rx_msg(skb);
+		chunk = min_t(unsigned int, rxm->full_len, len);
+		err = skb_copy_datagram_msg(skb, rxm->offset, msg, chunk);
+		if (err < 0)
+			goto recv_end;
+		copied += chunk;
+		len -= chunk;
+		if (likely(!(flags & MSG_PEEK))) {
+			if (copied < rxm->full_len) {
+				rxm->offset += copied;
+				rxm->full_len -= copied;
+			} else {
+				/* Finished with message */
+				msg->msg_flags |= MSG_EOR;
+				skb_unlink(skb, &((struct sock *)tsk)->sk_receive_queue);
+				kfree_skb(skb);
 			}
-			rxm->offset += copied;
-			rxm->full_len -= copied;
-		} else {
-			msg_finished:
-			/* Finished with message */
-			msg->msg_flags |= MSG_EOR;
-			skb_unlink(skb, &((struct sock *)tsk)->sk_receive_queue);
-			kfree_skb(skb);
 		}
-	}
-	ret = copied;
+
+	} while(len);
+
 recv_end:
 
 	release_sock(sock->sk);
-
+	ret = (copied)?copied:err;
 	return ret;
 }
 
@@ -1697,22 +1672,28 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	}
 
 	xprintk("--1");
-	tsk->aead_recv = crypto_alloc_aead(tsk->cipher_crypto,
-			CRYPTO_ALG_INTERNAL, 0);
-	xprintk("--1");
-	if (IS_ERR(tsk->aead_recv)) {
-		ret = PTR_ERR(tsk->aead_recv);
-		tsk->aead_recv = NULL;
-		goto bind_end;
+	if (!tsk->aead_recv) {
+		tsk->aead_recv = crypto_alloc_aead(tsk->cipher_crypto,
+				CRYPTO_ALG_INTERNAL, 0);
+		xprintk("--1");
+		if (IS_ERR(tsk->aead_recv)) {
+			ret = PTR_ERR(tsk->aead_recv);
+			tsk->aead_recv = NULL;
+			goto bind_end;
+		}
+
 	}
 
-	tsk->aead_send = crypto_alloc_aead(tsk->cipher_crypto,
-			CRYPTO_ALG_INTERNAL, 0);
-	if (IS_ERR(tsk->aead_send)) {
-		ret = PTR_ERR(tsk->aead_send);
-		tsk->aead_send = NULL;
-		goto bind_end;
+	if (!tsk->aead_send) {
+		tsk->aead_send = crypto_alloc_aead(tsk->cipher_crypto,
+				CRYPTO_ALG_INTERNAL, 0);
+		if (IS_ERR(tsk->aead_send)) {
+			ret = PTR_ERR(tsk->aead_send);
+			tsk->aead_send = NULL;
+			goto bind_end;
+		}
 	}
+
 
 	write_lock_bh(&tsk->socket->sk->sk_callback_lock);
 	tsk->rx_stopped = 0;
