@@ -374,42 +374,72 @@ static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
 	sg_mark_end(&sg[tsk->sendpage_ctx.used]);
 }
 
+//Must be called with socket callback locked
+static void tls_unattach(struct tls_sock *tsk)
+{
+	return;
+	tsk->socket->sk->sk_data_ready = tsk->saved_sk_data_ready;
+	tsk->socket->sk->sk_user_data = NULL;
+	if (tsk->aead_send) {
+		crypto_free_aead(tsk->aead_send);
+		tsk->aead_send = NULL;
+	}
+	if (tsk->aead_recv) {
+		crypto_free_aead(tsk->aead_recv);
+		tsk->aead_recv = NULL;
+	}
+
+}
+
 /*
- * //Returns the length of the unencrypted message, plus overhead
- * Note that this function also ppopulates tsk->header which is later
+ * Returns the length of the unencrypted message, plus overhead
+ * Note that this function also populates tsk->header which is later
  * used for decryption
+ * Returns 0 if more data is necessary to determine length
+ * Returns <0 if error occured
  */
 static inline ssize_t tls_read_size(struct tls_sock *tsk, struct sk_buff *skb)
 {
 	int ret;
 	size_t data_len = 0;
 	size_t datagram_len;
+	char first_byte;
 	char *header;
 	struct tls_rx_msg *rxm;
+	header = tsk->header_recv;
 	xprintk("--> %s", __FUNCTION__);
 
 	rxm = tls_rx_msg(skb);
+
+	ret = skb_copy_bits(skb, rxm->offset, &first_byte, 1);
+	if (ret < 0)
+		goto read_failure;
+
+	//Check the first byte to see if its a TLS record
+	if (first_byte != KTLS_RECORD_DATA) {
+		ret = -EBADMSG;
+		goto read_failure;
+	}
+
+	//We have a TLS record. Check that msglen is long enough to read the length of record.
+	//We must not check this before checking the first byte, since that will cause unencrypted
+	//messages shorter than KTLS_TLS_PREPEND_SIZE to not be read
+	if (rxm->offset + KTLS_TLS_PREPEND_SIZE > skb->len) {
+		ret = 0;
+		goto read_failure;
+	}
 
 	//Copy header to use later in decryption.
 	//An optimization could be to zero-copy, but you'd
 	//have to be able to deal with frag_list bs. This function call
 	//takes care of that
 	//Overhead is relatively small (13 bytes ish)
-	if (skb_copy_bits(skb, rxm->offset, tsk->header_recv,
-			KTLS_TLS_PREPEND_SIZE) < 0) {
-		ret = -EFAULT;
+	ret = skb_copy_bits(skb, rxm->offset, tsk->header_recv,
+			KTLS_TLS_PREPEND_SIZE);
+
+	if (ret < 0) {
 		goto read_failure;
 	}
-
-	header = tsk->header_recv;
-	// we handle only application data, let user space decide what
-	// to do otherwise
-	//
-	if (header[0] != KTLS_RECORD_DATA) {
-		ret = -EBADF;
-		goto read_failure;
-	}
-
 	if (IS_TLS(tsk)) {
 		data_len = ((header[4] & 0xFF) | (header[3] << 8));
 		data_len = data_len - KTLS_TAG_SIZE - KTLS_IV_SIZE;
@@ -570,6 +600,7 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 
 			len = tls_read_size(tsk, head);
 
+			//Is this a sane packet?
 			if (!len) {
 				/* Need more header to determine length */
 
@@ -577,21 +608,22 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 				eaten += uneaten;
 				WARN_ON(eaten != orig_len);
 				break;
+			} else if (len < 0) {
+				/* Data does not appear to be a TLS record
+				 * Make userspace handle it
+				 */
+				goto decryption_fail;
 			} else if (len > tsk->socket->sk->sk_rcvbuf) {
 				/* Message length exceeds maximum allowed */
-				desc->error = -EMSGSIZE;
-				tsk->rx_skb_head = NULL;
-				//kcm_abort_rx_tsk(tsk, EMSGSIZE, head);
-				break;
+				//TODO: ????
+				goto decryption_fail;
 			} else if (len <= (ssize_t)head->len -
 					  skb->len - rxm->offset) {
 				/* Length must be into new skb (and also
 				 * greater than zero)
 				 */
-				desc->error = -EPROTO;
-				tsk->rx_skb_head = NULL;
-				//kcm_abort_rx_tsk(tsk, EPROTO, head);
-				break;
+				//TODO: ????
+				goto decryption_fail;
 			}
 
 			rxm->full_len = len;
@@ -638,11 +670,6 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 
 		WARN_ON(extra > uneaten);
 
-		eaten += (uneaten - extra);
-
-		/* Hurray, we have a new message! */
-		tsk->rx_skb_head = NULL;
-
 		/*
 		 * Possible security vulnerability since skb can require
 		 * more than ALG_MAX_PAGES sg's.
@@ -669,19 +696,30 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 				rxm->full_len - KTLS_TLS_OVERHEAD);
 
 		if (ret < 0)
-			break;
+			goto decryption_fail;
+
 
 		ret = tls_post_process(tsk, head);
 
 		if (ret < 0)
-			break;
+			goto decryption_fail;
+
+		/* Hurray, we have a new message! */
+		tsk->rx_skb_head = NULL;
+		eaten += (uneaten - extra);
 
 		sock_queue_rcv_skb((struct sock *)tsk, head);
 	}
+done:
 	if (cloned_orig)
 		kfree_skb(orig_skb);
-
 	return eaten;
+decryption_fail:
+	desc->error = -EBADMSG;
+	tsk->rx_skb_head = NULL;
+	desc->count = 0;
+	tsk->rx_stopped = 1;
+	goto done;
 }
 
 static int tls_tcp_read_sock(struct tls_sock *tsk)
@@ -702,7 +740,7 @@ static void tls_data_ready(struct sock *sk)
 {
 
 	struct tls_sock *tsk;
-
+	int ret;
 	xprintk("--> %s", __FUNCTION__);
 
 	read_lock_bh(&sk->sk_callback_lock);
@@ -719,9 +757,18 @@ static void tls_data_ready(struct sock *sk)
 			goto out;
 	}
 
-	if (tls_tcp_read_sock(tsk) == -ENOMEM)
+	ret = tls_tcp_read_sock(tsk);
+	if (ret == -ENOMEM) /* No memory. Do it later */
 		queue_work(tls_wq, &tsk->recv_work);
 		//queue_delayed_work(tls_wq, &tsk->recv_work, 0);
+	/* TLS couldn't handle this message. Pass it directly to userspace */
+	else if (ret == -EBADMSG) {
+		tsk->saved_sk_data_ready(tsk->socket->sk);
+		tls_unattach(tsk);
+	}
+
+
+
 
   out:
 	read_unlock_bh(&sk->sk_callback_lock);
@@ -730,6 +777,7 @@ static void tls_data_ready(struct sock *sk)
 static void do_tls_sock_rx_work(struct tls_sock *tsk)
 {
 	read_descriptor_t rd_desc;
+	int ret;
 	struct sock *sk = tsk->socket->sk;
 
 	/* We need the read lock to synchronize with tls_sock_tcp_data_ready. We
@@ -744,12 +792,22 @@ static void do_tls_sock_rx_work(struct tls_sock *tsk)
 	if (unlikely(tsk->rx_stopped))
 		goto out;
 
-
 	rd_desc.arg.data = tsk;
 
-	if (tls_tcp_read_sock(tsk) == -ENOMEM)
+	ret = tls_tcp_read_sock(tsk);
+	if (ret == -ENOMEM) /* No memory. Do it later */
 		queue_work(tls_wq, &tsk->recv_work);
 		//queue_delayed_work(tls_wq, &tsk->recv_work, 0);
+
+	/* TLS couldn't handle this message. Pass it directly to userspace
+	 * Also unattach the KTLS socket, since it is unusable at this point
+	 */
+
+	else if (ret == -EBADMSG) {
+		tsk->saved_sk_data_ready(tsk->socket->sk);
+		//TODO: Socket error
+		tls_unattach(tsk);
+	}
 
 out:
 	read_unlock_bh(&sk->sk_callback_lock);
@@ -830,6 +888,7 @@ init_aead_end:
 	return ret ?: 0;
 }
 
+//TODO: No lock?
 static int tls_set_key(struct socket *sock,
 		int recv,
 		char __user *src,
@@ -1426,10 +1485,13 @@ static int tls_recvmsg(struct socket *sock,
 
 	timeo = sock_rcvtimeo(&tsk->sk, flags & MSG_DONTWAIT);
 
-	//Consider helping with decryption
+	//TODO: Consider helping with decryption
 	skb = tls_wait_data(tsk, flags, timeo, &err);
-	if (!skb)
+	if (!skb) {
+		ret = err;
 		goto recv_end;
+	}
+
 	rxm = tls_rx_msg(skb);
 
 	if (len > rxm->full_len)
@@ -1577,6 +1639,7 @@ sendpage_end:
 	return ret < 0 ? ret : size;
 }
 
+//TODO: When binding, blow away all skbs from underlying socket
 static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 {
 	int ret;
