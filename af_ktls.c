@@ -1348,16 +1348,6 @@ static int tls_post_process(const struct tls_sock *tsk, struct sk_buff *skb)
 	return 0;
 }
 
-//TODO: Don't support this for now.
-static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
-				       struct pipe_inode_info *pipe,
-				       size_t size, unsigned int flags)
-{
-	ssize_t ret;
-	ret = -EOPNOTSUPP;
-	return ret;
-}
-
 static unsigned int tls_poll(struct file *file, struct socket *sock,
               struct poll_table_struct *wait) {
 
@@ -1462,7 +1452,7 @@ static int tls_recvmsg(struct socket *sock,
 	lock_sock(sock->sk);
 
 	if (!KTLS_RECV_READY(tsk)) {
-		ret = -EBADMSG;
+		err = -EBADMSG;
 		goto recv_end;
 	}
 
@@ -1498,6 +1488,66 @@ static int tls_recvmsg(struct socket *sock,
 recv_end:
 
 	release_sock(sock->sk);
+	ret = (copied)?copied:err;
+	return ret;
+}
+
+static ssize_t tls_sock_splice(struct sock *sk,
+			       struct pipe_inode_info *pipe,
+			       struct splice_pipe_desc *spd)
+{
+	int ret;
+
+	release_sock(sk);
+	ret = splice_to_pipe(pipe, spd);
+	lock_sock(sk);
+
+	return ret;
+}
+
+
+//TODO: Splice across record boundaries
+static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
+				       struct pipe_inode_info *pipe,
+				       size_t len, unsigned int flags)
+{
+	ssize_t copied;
+	long timeo;
+	struct tls_sock *tsk;
+	struct tls_rx_msg *rxm;
+	int ret = 0;
+	struct sk_buff *skb;
+	int chunk;
+	int err = 0;
+	struct sock *sk = sock->sk;
+	xprintk("--> %s", __FUNCTION__);
+
+	tsk = tls_sk(sk);
+	lock_sock(sk);
+
+	if (!KTLS_RECV_READY(tsk)) {
+		err = -EBADMSG;
+		goto splice_read_end;
+	}
+
+	timeo = sock_rcvtimeo(&tsk->sk, flags & MSG_DONTWAIT);
+
+	skb = tls_wait_data(tsk, flags, timeo, &err);
+	if (!skb)
+		goto splice_read_end;
+
+	rxm = tls_rx_msg(skb);
+	chunk = min_t(unsigned int, rxm->full_len, len);
+	copied = skb_splice_bits(skb, sk, rxm->offset, pipe, chunk, flags, tls_sock_splice);
+	if (ret < 0) {
+		goto splice_read_end;
+	}
+
+	rxm->offset += copied;
+	rxm->full_len -= copied;
+
+splice_read_end:
+	release_sock(sk);
 	ret = (copied)?copied:err;
 	return ret;
 }
