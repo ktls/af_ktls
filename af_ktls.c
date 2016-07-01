@@ -615,16 +615,14 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 				 * Make userspace handle it
 				 */
 				goto decryption_fail;
-			} else if (len > tsk->socket->sk->sk_rcvbuf) {
+			} else if (len > KTLS_MAX_PAYLOAD_SIZE) {
 				/* Message length exceeds maximum allowed */
-				/*TODO: ???? */
 				goto decryption_fail;
 			} else if (len <= (ssize_t)head->len -
 					  skb->len - rxm->offset) {
 				/* Length must be into new skb (and also
 				 * greater than zero)
 				 */
-				/*TODO: ???? */
 				goto decryption_fail;
 			}
 
