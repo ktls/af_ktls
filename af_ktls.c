@@ -456,7 +456,7 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 			unsigned int orig_offset, size_t orig_len)
 {
 	struct tls_sock *tsk = (struct tls_sock *)desc->arg.data;
-
+	struct sock *sk = (struct sock *)tsk;
 	struct tls_rx_msg *rxm;
 	struct sk_buff *head, *skb;
 	size_t eaten = 0, uneaten;
@@ -548,6 +548,9 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 		/* Always clone since we will consume something */
 
 		//GFP_ATOMIC since we may be in softirq
+		/* skb_copy for now. SKB data may be in high memory, which the
+		 * decryption API does not currently have support for.
+		 */
 		skb = skb_copy(orig_skb, GFP_ATOMIC);
 		if (!skb) {
 			desc->error = -ENOMEM;
@@ -690,18 +693,20 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 		tsk->rx_skb_head = NULL;
 		eaten += (uneaten - extra);
 
-		sock_queue_rcv_skb((struct sock *)tsk, head);
+		sock_queue_rcv_skb(sk, head);
 	}
 done:
 	if (cloned_orig)
 		kfree_skb(orig_skb);
 	return eaten;
 decryption_fail:
+	kfree_skb(skb);
 	desc->error = -EBADMSG;
 	tsk->rx_skb_head = NULL;
 	desc->count = 0;
 	tsk->rx_stopped = 1;
 	((struct sock *)tsk)->sk_err = -EBADMSG;
+	sk->sk_error_report(sk);
 	goto done;
 }
 
@@ -718,12 +723,28 @@ static int tls_tcp_read_sock(struct tls_sock *tsk)
 
 	return desc.error;
 }
+
+static void do_tls_data_ready(struct tls_sock *tsk)
+{
+	int ret;
+
+	ret = tls_tcp_read_sock(tsk);
+	if (ret == -ENOMEM) /* No memory. Do it later */
+		queue_work(tls_wq, &tsk->recv_work);
+	//queue_delayed_work(tls_wq, &tsk->recv_work, 0);
+	/* TLS couldn't handle this message. Pass it directly to userspace */
+	else if (ret == -EBADMSG) {
+		tsk->saved_sk_data_ready(tsk->socket->sk);
+		tls_unattach(tsk);
+	}
+
+}
+
 // Called with lower socket held
 static void tls_data_ready(struct sock *sk)
 {
 
 	struct tls_sock *tsk;
-	int ret;
 	xprintk("--> %s", __FUNCTION__);
 
 	read_lock_bh(&sk->sk_callback_lock);
@@ -740,18 +761,7 @@ static void tls_data_ready(struct sock *sk)
 			goto out;
 	}
 
-	ret = tls_tcp_read_sock(tsk);
-	if (ret == -ENOMEM) /* No memory. Do it later */
-		queue_work(tls_wq, &tsk->recv_work);
-		//queue_delayed_work(tls_wq, &tsk->recv_work, 0);
-	/* TLS couldn't handle this message. Pass it directly to userspace */
-	else if (ret == -EBADMSG) {
-		tsk->saved_sk_data_ready(tsk->socket->sk);
-		tls_unattach(tsk);
-	}
-
-
-
+	do_tls_data_ready(tsk);
 
   out:
 	read_unlock_bh(&sk->sk_callback_lock);
@@ -759,8 +769,6 @@ static void tls_data_ready(struct sock *sk)
 
 static void do_tls_sock_rx_work(struct tls_sock *tsk)
 {
-	read_descriptor_t rd_desc;
-	int ret;
 	struct sock *sk = tsk->socket->sk;
 
 	/* We need the read lock to synchronize with tls_sock_tcp_data_ready. We
@@ -775,21 +783,7 @@ static void do_tls_sock_rx_work(struct tls_sock *tsk)
 	if (unlikely(tsk->rx_stopped))
 		goto out;
 
-	rd_desc.arg.data = tsk;
-
-	ret = tls_tcp_read_sock(tsk);
-	if (ret == -ENOMEM) /* No memory. Do it later */
-		queue_work(tls_wq, &tsk->recv_work);
-		//queue_delayed_work(tls_wq, &tsk->recv_work, 0);
-
-	/* TLS couldn't handle this message. Pass it directly to userspace
-	 * Also unattach the KTLS socket, since it is unusable at this point
-	 */
-
-	else if (ret == -EBADMSG) {
-		tsk->saved_sk_data_ready(tsk->socket->sk);
-		tls_unattach(tsk);
-	}
+	do_tls_data_ready(tsk);
 
 out:
 	read_unlock_bh(&sk->sk_callback_lock);
@@ -1432,7 +1426,6 @@ static struct sk_buff *tls_wait_data(struct tls_sock *tsk, int flags,
 	return skb;
 }
 
-//TODO: Implement TCP (stream-like) behavior
 static int tls_recvmsg(struct socket *sock,
 		struct msghdr *msg,
 		size_t len,
@@ -1744,6 +1737,7 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		}
 	}
 
+	((struct sock *)tsk)->sk_err = 0;
 
 	write_lock_bh(&tsk->socket->sk->sk_callback_lock);
 	tsk->rx_stopped = 0;
