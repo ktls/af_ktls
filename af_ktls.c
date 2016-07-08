@@ -194,10 +194,10 @@ struct tls_sock {
 	/*
 	 * Context for {set,get}sockopt()
 	 */
-	char *iv_send;
+	unsigned char *iv_send;
 	struct tls_key key_send;
 
-	char *iv_recv;
+	unsigned char *iv_recv;
 	struct tls_key key_recv;
 
 	struct crypto_aead *aead_send;
@@ -286,12 +286,15 @@ static inline struct tls_sock *tls_sk(struct sock *sk)
 	return (struct tls_sock *)sk;
 }
 
-static void increment_seqno(char *s)
+void increment_seqno(unsigned char *seq)
 {
-	u64 *seqno = (u64 *) s;
-	u64 seq_h = be64_to_cpu(*seqno);
-	seq_h++;
-	*seqno = cpu_to_be64(seq_h);
+    int i;
+
+    for (i = 7; i >= 0; i--) {
+        ++seq[i];
+        if (seq[i] != 0)
+            break;
+    }
 }
 
 static void tls_free_sendpage_ctx(struct tls_sock *tsk)
@@ -388,7 +391,7 @@ static int tls_set_iv(struct socket *sock,
 		size_t src_len)
 {
 	int ret;
-	char **iv;
+	unsigned char **iv;
 	struct sock *sk;
 	struct tls_sock *tsk;
 
