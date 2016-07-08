@@ -304,15 +304,21 @@ static inline void tls_make_aad(struct tls_sock *tsk,
 
 static int tls_post_process(const struct tls_sock *tsk, struct sk_buff *skb);
 
-void increment_seqno(unsigned char *seq)
+static void increment_seqno(unsigned char *seq, struct tls_sock *tsk)
 {
-    int i;
+	int i;
 
-    for (i = 7; i >= 0; i--) {
-        ++seq[i];
-        if (seq[i] != 0)
-            break;
-    }
+	for (i = 7; i >= 0; i--) {
+		++seq[i];
+		if (seq[i] != 0)
+			break;
+	}
+	/*
+	 * Check for overflow. If overflowed, connection must disconnect.
+	 * Raise an error and notify userspace.
+	 */
+	if (unlikely((IS_TLS(tsk) && i == -1) || (IS_DTLS(tsk) && i <= 1)))
+		tls_err_abort(tsk);
 }
 
 static void tls_free_sendpage_ctx(struct tls_sock *tsk)
@@ -1489,7 +1495,7 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 			KTLS_RECORD_SIZE(tsk, size));
 
 	if (ret > 0) {
-		increment_seqno(tsk->iv_send);
+		increment_seqno(tsk->iv_send, tsk);
 		ret = size;
 	}
 
@@ -1691,7 +1697,21 @@ static int tls_recvmsg(struct socket *sock,
 
 	} while (len);
 
+<<<<<<< f3831318df4debcf6cd5e2a846470000aa9b98fc
 recv_end:
+=======
+	if (ret > 0) {
+		increment_seqno(tsk->iv_recv, tsk);
+		tls_pop_record(tsk, data_len);
+	}
+
+splice_read_end:
+	// restore chaining for receiving
+	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv[0].sg);
+
+	if (ret > 0)
+		queue_work(tls_wq, &tsk->recv_work);
+>>>>>>> Added check for wrap around. Requires buffer revamp patch for tls_err_abort() to be defined
 
 	release_sock(sock->sk);
 	ret = copied ? : err;
@@ -1784,12 +1804,17 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 	if (!skb)
 		goto splice_read_end;
 
+<<<<<<< f3831318df4debcf6cd5e2a846470000aa9b98fc
 	rxm = tls_rx_msg(skb);
 	chunk = min_t(unsigned int, rxm->full_len, len);
 	copied = skb_splice_bits(skb, sk, rxm->offset, pipe, chunk,
 			flags, tls_sock_splice);
 	if (ret < 0)
 		goto splice_read_end;
+=======
+	tls_pop_record(tsk, ret);
+	increment_seqno(tsk->iv_recv, tsk);
+>>>>>>> Added check for wrap around. Requires buffer revamp patch for tls_err_abort() to be defined
 
 	rxm->offset += copied;
 	rxm->full_len -= copied;
@@ -1834,7 +1859,7 @@ static ssize_t tls_do_sendpage(struct tls_sock *tsk)
 	ret = kernel_sendmsg(tsk->socket, &msg, tsk->vec_send, KTLS_VEC_SIZE,
 			KTLS_RECORD_SIZE(tsk, data_len));
 	if (ret > 0) {
-		increment_seqno(tsk->iv_send);
+		increment_seqno(tsk->iv_send, tsk);
 		tls_update_senpage_ctx(tsk, data_len);
 	} else
 		tls_free_sendpage_ctx(tsk);
