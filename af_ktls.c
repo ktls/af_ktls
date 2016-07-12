@@ -997,7 +997,7 @@ static inline ssize_t tls_peek_data(struct tls_sock *tsk, unsigned flags)
 		}
 
 		if (data_len > KTLS_MAX_PAYLOAD_SIZE) {
-			ret = -E2BIG;
+			ret = -EMSGSIZE;
 			goto peek_failure;
 		}
 
@@ -1194,7 +1194,7 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 		}
 
 		if (data_len > size) {
-			ret = -E2BIG;
+			ret = -EMSGSIZE;
 			goto splice_read_end;
 		}
 
