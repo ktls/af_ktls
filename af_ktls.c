@@ -563,14 +563,15 @@ static int tls_setsockopt(struct socket *sock,
 	xprintk("--> %s", __FUNCTION__);
 
 	tsk = tls_sk(sock->sk);
-
 	if (level != AF_KTLS)
 		return -ENOPROTOOPT;
 
-	if (!KTLS_SETSOCKOPT_READY(tsk))
-		return -EBADMSG;
+	lock_sock(sock->sk);
 
 	ret = -EBADMSG;
+	if (!KTLS_SETSOCKOPT_READY(tsk))
+		goto setsockopt_end;
+
 
 	switch (optname) {
 		case KTLS_SET_IV_RECV:
@@ -607,7 +608,8 @@ static int tls_setsockopt(struct socket *sock,
 	 * The same applies to DTLS window
 	 */
 	DTLS_WINDOW_INIT(tsk->dtls_window);
-
+setsockopt_end:
+	release_sock(sock->sk);
 	return ret < 0 ? ret : 0;
 }
 
@@ -700,14 +702,17 @@ static int tls_getsockopt(struct socket *sock,
 	if (level != AF_KTLS)
 		return -ENOPROTOOPT;
 
-	if (!KTLS_GETSOCKOPT_READY(tsk))
-		return -EBADMSG;
-
 	if (optlen == 0 || optval == NULL)
 		return -EBADMSG;
 
 	if (get_user(len, optlen))
 		return -EFAULT;
+
+	lock_sock(sock->sk);
+
+	ret = -EBADMSG;
+	if (!KTLS_GETSOCKOPT_READY(tsk))
+		goto end;
 
 	switch (optname) {
 		case KTLS_GET_IV_RECV:
@@ -729,17 +734,22 @@ static int tls_getsockopt(struct socket *sock,
 			ret = tls_get_salt(tsk, 0, optval, len);
 			break;
 		case KTLS_GET_MTU:
-			if (len < sizeof(tsk->mtu_payload))
-				return -ENOMEM;
-
-			if (put_user(sizeof(tsk->mtu_payload), optlen))
-				return -EFAULT;
-
+			if (len < sizeof(tsk->mtu_payload)) {
+				ret = -ENOMEM;
+				goto end;
+			}
+			if (put_user(sizeof(tsk->mtu_payload), optlen)) {
+				ret = -EFAULT;
+				goto end;
+			}
 			mtu = KTLS_RECORD_SIZE(tsk, tsk->mtu_payload);
-			if (copy_to_user(optval, &mtu, sizeof(mtu)))
-				return -EFAULT;
+			if (copy_to_user(optval, &mtu, sizeof(mtu))) {
+				ret = -EFAULT;
+				goto end;
+			}
 
-			return 0;
+			ret = 0;
+			goto end;
 		default:
 			ret = -EBADMSG;
 			break;
@@ -751,6 +761,7 @@ static int tls_getsockopt(struct socket *sock,
 	ret = copy_to_user(optlen, &ret, sizeof(*optlen));
 
 end:
+	release_sock(sock->sk);
 	return ret;
 }
 
@@ -1502,10 +1513,12 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 			return -ENOENT;
 	}
 
+	lock_sock(sock->sk);
 	tsk->socket = sockfd_lookup(sa_ktls->sa_socket, &ret);
-	if (tsk->socket == NULL)
-		return -ENOENT;
-
+	if (tsk->socket == NULL) {
+		ret = -ENOENT;
+		goto bind_end;
+	}
 	if (!IS_TCP(tsk->socket) && !IS_UDP(tsk->socket)) {
 		ret = -EAFNOSUPPORT;
 		goto bind_end;
@@ -1543,12 +1556,13 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	tsk->socket->sk->sk_data_ready = tls_data_ready;
 	tsk->socket->sk->sk_user_data = tsk;
 	write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
-
+	release_sock(sock->sk);
 	return 0;
 
 bind_end:
 	sockfd_put(tsk->socket);
 	tsk->socket = NULL;
+	release_sock(sock->sk);
 	return ret;
 }
 
