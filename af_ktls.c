@@ -412,6 +412,11 @@ static int decrypt_skb(struct tls_sock *tsk, struct sk_buff *skb)
 	prepend = IS_TLS(tsk) ? KTLS_TLS_PREPEND_SIZE : KTLS_DTLS_PREPEND_SIZE;
 	overhead = IS_TLS(tsk) ? KTLS_TLS_OVERHEAD : KTLS_DTLS_OVERHEAD;
 	rxm = tls_rx_msg(skb);
+
+
+	sg_init_table(tsk->sgin, ARRAY_SIZE(tsk->sgin));
+	sg_set_buf(&tsk->sgin[0], tsk->aad_recv, sizeof(tsk->aad_recv));
+
 	/*
 	 * Possible security vulnerability since skb can require
 	 * more than ALG_MAX_PAGES sg's.
@@ -632,12 +637,7 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 	while (eaten < orig_len) {
 		int ret;
 		/* Always clone since we will consume something */
-
-		/*GFP_ATOMIC since we may be in softirq */
-		/* skb_copy for now. SKB data may be in high memory, which the
-		 * decryption API does not currently have support for.
-		 */
-		skb = skb_copy(orig_skb, GFP_ATOMIC);
+		skb = skb_clone(orig_skb, GFP_ATOMIC);
 		if (!skb) {
 			desc->error = -ENOMEM;
 			break;
@@ -856,11 +856,7 @@ static int dtls_udp_read_sock(struct tls_sock *tsk)
 		if (dtls_window(tsk, tsk->header_recv + KTLS_DTLS_SEQ_NUM_OFFSET) < 0)
 			goto record_pop;
 
-		/*GFP_ATOMIC since we may be in softirq */
-		/* skb_copy for now. SKB data may be in high memory, which the
-		 * decryption API does not currently have support for.
-		 */
-		skb = skb_copy(p, GFP_ATOMIC);
+		skb = skb_clone(p, GFP_ATOMIC);
 		if (!skb) {
 			ret = -ENOMEM;
 			break;
@@ -2173,9 +2169,6 @@ static int tls_create(struct net *net,
 
 	sg_unmark_end(&tsk->sgaad_send[1]);
 	sg_chain(tsk->sgaad_send, 2, tsk->sgl_send[0].sg);
-
-	sg_init_table(tsk->sgin, ARRAY_SIZE(tsk->sgin));
-	sg_set_buf(&tsk->sgin[0], tsk->aad_recv, sizeof(tsk->aad_recv));
 	INIT_WORK(&tsk->recv_work, tls_rx_work);
 
 	return 0;
