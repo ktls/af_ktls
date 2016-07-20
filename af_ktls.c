@@ -776,10 +776,18 @@ static void do_tls_data_ready(struct tls_sock *tsk)
 {
 	int ret;
 
+	if (tsk->rx_need_bytes) {
+		if (tcp_inq(tsk->socket->sk) >= tsk->rx_need_bytes)
+			tsk->rx_need_bytes = 0;
+		else
+			return;
+	}
+
 	ret = tls_tcp_read_sock(tsk);
 	if (ret == -ENOMEM) /* No memory. Do it later */
 		queue_work(tls_wq, &tsk->recv_work);
 	/*queue_delayed_work(tls_wq, &tsk->recv_work, 0); */
+
 	/* TLS couldn't handle this message. Pass it directly to userspace */
 	else if (ret == -EBADMSG)
 		tls_err_abort(tsk);
@@ -799,11 +807,9 @@ static void tls_data_ready(struct sock *sk)
 	if (unlikely(!tsk || tsk->rx_stopped))
 		goto out;
 
-	if (tsk->rx_need_bytes) {
-		if (tcp_inq(sk) >= tsk->rx_need_bytes)
-			tsk->rx_need_bytes = 0;
-		else
-			goto out;
+	if (!KTLS_RECV_READY(tsk)) {
+		queue_work(tls_wq, &tsk->recv_work);
+		goto out;
 	}
 
 	do_tls_data_ready(tsk);
@@ -902,6 +908,11 @@ static void dtls_data_ready(struct sock *sk)
 	if (unlikely(!tsk || tsk->rx_stopped))
 		goto out;
 
+	if (!KTLS_RECV_READY(tsk)) {
+		queue_work(tls_wq, &tsk->recv_work);
+		goto out;
+	}
+
 	do_dtls_data_ready(tsk);
 out:
 	read_unlock_bh(&sk->sk_callback_lock);
@@ -922,6 +933,11 @@ static void do_tls_sock_rx_work(struct tls_sock *tsk)
 
 	if (unlikely(tsk->rx_stopped))
 		goto out;
+
+	if (!KTLS_RECV_READY(tsk)) {
+		queue_work(tls_wq, &tsk->recv_work);
+		goto out;
+	}
 
 	if (IS_TLS(tsk))
 		do_tls_data_ready(tsk);
