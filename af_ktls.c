@@ -418,8 +418,6 @@ static int decrypt_skb(struct tls_sock *tsk, struct sk_buff *skb)
 	sg_set_buf(&tsk->sgin[0], tsk->aad_recv, sizeof(tsk->aad_recv));
 
 	/*
-	 * Possible security vulnerability since skb can require
-	 * more than ALG_MAX_PAGES sg's.
 	 * TODO: So what exactly happens if skb_to_sgvec causes more
 	 * than ALG_MAX_PAGES fragments? Consider allocating kernel
 	 * pages
@@ -429,6 +427,17 @@ static int decrypt_skb(struct tls_sock *tsk, struct sk_buff *skb)
 	nsg = skb_to_sgvec(skb, &tsk->sgin[1], rxm->offset +
 			prepend,
 			rxm->full_len - prepend);
+
+	/*
+	 * The length of sg into decryption must not be over
+	 * ALG_MAX_PAGES. The aad takes the first sg, so the
+	 * payload must be less than ALG_MAX_PAGES - 1
+	 */
+	if (nsg > ALG_MAX_PAGES - 1) {
+		ret = -EBADMSG;
+		goto decryption_fail;
+	}
+
 	tls_make_aad(tsk, 1, tsk->aad_recv,
 			rxm->full_len - overhead,
 			tsk->iv_recv);
@@ -737,8 +746,9 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 
 		WARN_ON(extra > uneaten);
 
-
 		ret = decrypt_skb(tsk, head);
+		if (ret < 0)
+			goto decryption_fail;
 
 		/* Hurray, we have a new message! */
 		tsk->rx_skb_head = NULL;
