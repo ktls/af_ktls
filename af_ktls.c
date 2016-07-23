@@ -1124,6 +1124,18 @@ static int tls_set_mtu(struct socket *sock, char __user *src, size_t src_len)
 	return mtu;
 }
 
+static void tls_do_unattach(struct socket *sock)
+{
+	struct tls_sock *tsk;
+	struct sock *sk;
+
+	tsk = tls_sk(sock->sk);
+	sk = tsk->socket->sk;
+
+	read_lock_bh(&sk->sk_callback_lock);
+	tls_err_abort(tsk);
+	read_unlock_bh(&sk->sk_callback_lock);
+}
 static int tls_setsockopt(struct socket *sock,
 		int level, int optname,
 		char __user *optval,
@@ -1165,6 +1177,10 @@ static int tls_setsockopt(struct socket *sock,
 		break;
 	case KTLS_SET_MTU:
 		ret = tls_set_mtu(sock, optval, optlen);
+		break;
+	case KTLS_UNATTACH:
+		tls_do_unattach(sock);
+		ret = 0;
 		break;
 	default:
 		break;
