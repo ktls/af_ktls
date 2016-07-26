@@ -520,8 +520,8 @@ static inline ssize_t tls_read_size(struct tls_sock *tsk, struct sk_buff *skb)
 	/*
 	 *Copy header to use later in decryption.
 	 *An optimization could be to zero-copy, but you'd
-	 *have to be able to deal with frag_list bs. This function call
-	 *takes care of that
+	 *have to be able to walk frag_lists. This function call
+	 *takes care of that.
 	 *Overhead is relatively small (13 bytes for TLS, 21 for DTLS)
 	 */
 	ret = skb_copy_bits(skb, rxm->offset, tsk->header_recv,
@@ -1989,6 +1989,13 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	tsk->socket->sk->sk_user_data = tsk;
 	write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
 
+	/* Check if any TLS packets have come in between the time the
+	 * handshake was completed and bin() was called. If there were,
+	 * the packets would have woken up TCP socket waiters, not
+	 * KTLS. Therefore, pull the packets from TCP and wake up KTLS
+	 * if necessary
+	 */
+	do_tls_sock_rx_work(tsk);
 	return 0;
 
 bind_end:
