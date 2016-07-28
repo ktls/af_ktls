@@ -28,6 +28,7 @@
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <linux/skbuff.h>
+#include <linux/log2.h>
 
 #include "af_ktls.h"
 
@@ -1452,12 +1453,12 @@ static int tls_do_encryption(struct tls_sock *tsk,
 /*
  * Allocates enough pages to hold the decrypted data, as well as
  * setting tsk->sg_tx_data to the pages
- * Return the number of pages allocated, or -ENOMEM on failure
- * TODO: Still allocates too many pages (See #65)
+ * Return the log 2 of number of pages allocated, or -ENOMEM on failure
  */
 static int tls_pre_encrypt(struct tls_sock *tsk, size_t data_len) {
 	int i;
 	unsigned npages;
+	unsigned order_npages;
 	size_t aligned_size;
 	size_t encrypt_len;
 	struct scatterlist *sg;
@@ -1468,12 +1469,15 @@ static int tls_pre_encrypt(struct tls_sock *tsk, size_t data_len) {
 	aligned_size = npages * PAGE_SIZE;
 	if (aligned_size < encrypt_len)
 		npages++;
+
+	order_npages = order_base_2(npages);
+	WARN_ON(order_npages < 0 || order_npages > 3);
 	/*
 	 * The first entry in sg_tx_data is AAD so skip it
 	 */
 	sg_init_table(tsk->sg_tx_data, KTLS_SG_DATA_SIZE);
 	sg_set_buf(&tsk->sg_tx_data[0], tsk->aad_send, sizeof(tsk->aad_send));
-	tsk->pages_send = alloc_pages(GFP_KERNEL, npages);
+	tsk->pages_send = alloc_pages(GFP_KERNEL, order_npages);
 	if (!tsk->pages_send) {
 		ret = -ENOMEM;
 		goto bail;
@@ -1490,7 +1494,7 @@ static int tls_pre_encrypt(struct tls_sock *tsk, size_t data_len) {
 		sg_set_page(sg + i,
 				tsk->pages_send + i,
 				PAGE_SIZE, 0);
-	ret = npages;
+	ret = order_npages;
 bail:
 	return ret;
 }
@@ -1502,7 +1506,7 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	unsigned int cnt = 0;
 	int ret = 0;
 
-	int npages = 0;
+	int order_npages = 0;
 	xprintk("--> %s", __FUNCTION__);
 
 	tsk = tls_sk(sock->sk);
@@ -1543,18 +1547,17 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	sg_chain(tsk->sgl_send[cnt-1].sg, tsk->sgl_send[cnt-1].npages + 1,
 			tsk->sgtag_send);
 
-	npages = tls_pre_encrypt(tsk, size);
-	if (npages < 0) {
-		ret = npages;
+	ret = tls_pre_encrypt(tsk, size);
+	if (ret < 0) {
 		goto send_end;
 	}
 
+	order_npages = ret;
 	ret = tls_do_encryption(tsk, tsk->sgaad_send, tsk->sg_tx_data, size);
 	if (ret < 0)
 		goto encrypt_failed;
 
-	tls_make_prepend(tsk, tsk->header_send, size);
-	memcpy(page_address(tsk->pages_send), tsk->header_send, KTLS_PREPEND_SIZE(tsk));
+	tls_make_prepend(tsk, page_address(tsk->pages_send), size);
 	/*
 	 * The whole record is sent in one go, instead of 3 separate calls
 	 * to kernel_sendpage. We don't want to deal with the situation
@@ -1566,7 +1569,7 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	ret = kernel_sendpage(tsk->socket,
 			tsk->pages_send,
 			/*offset*/ 0,
-			size + KTLS_OVERHEAD(tsk), 0);
+			size + KTLS_OVERHEAD(tsk), msg->msg_flags);
 
 	if (ret > 0) {
 		increment_seqno(tsk->iv_send, tsk);
@@ -1586,7 +1589,7 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
  *
  */
 encrypt_failed:
-	__free_pages(tsk->pages_send, npages);
+	__free_pages(tsk->pages_send, order_npages);
 send_end:
 	for (i = 0; i < cnt; i++)
 		af_alg_free_sg(&tsk->sgl_send[i]);
