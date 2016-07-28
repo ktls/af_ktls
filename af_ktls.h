@@ -37,6 +37,7 @@
 #define KTLS_SET_KEY_SEND		5
 #define KTLS_SET_SALT_SEND		6
 #define KTLS_SET_MTU			7
+#define KTLS_UNATTACH			8
 
 /*
  * setsockopt() optnames
