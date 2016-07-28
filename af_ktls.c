@@ -7,6 +7,7 @@
  *   Fridolin Pokorny <fridolin.pokorny@gmail.com>
  *   Nikos Mavrogiannopoulos <nmav@gnults.org>
  *   Dave Watson <davejwatson@fb.com>
+ *   Lance Chao <lancerchao@fb.com>
  *
  * Based on RFC 5288, RFC 6347, RFC 5246, RFC 6655
  *
@@ -1157,14 +1158,15 @@ static int tls_setsockopt(struct socket *sock,
 	xprintk("--> %s", __func__);
 
 	tsk = tls_sk(sock->sk);
-
 	if (level != AF_KTLS)
 		return -ENOPROTOOPT;
 
-	if (!KTLS_SETSOCKOPT_READY(tsk))
-		return -EBADMSG;
+	lock_sock(sock->sk);
 
 	ret = -EBADMSG;
+	if (!KTLS_SETSOCKOPT_READY(tsk))
+		goto setsockopt_end;
+
 
 	switch (optname) {
 	case KTLS_SET_IV_RECV:
@@ -1195,6 +1197,9 @@ static int tls_setsockopt(struct socket *sock,
 	default:
 		break;
 	}
+
+setsockopt_end:
+	release_sock(sock->sk);
 	return ret < 0 ? ret : 0;
 }
 
@@ -1287,49 +1292,57 @@ static int tls_getsockopt(struct socket *sock,
 	if (level != AF_KTLS)
 		return -ENOPROTOOPT;
 
-	if (!KTLS_GETSOCKOPT_READY(tsk))
-		return -EBADMSG;
-
 	if (optlen == 0 || optval == NULL)
 		return -EBADMSG;
 
 	if (get_user(len, optlen))
 		return -EFAULT;
 
+	lock_sock(sock->sk);
+
+	ret = -EBADMSG;
+	if (!KTLS_GETSOCKOPT_READY(tsk))
+		goto end;
+
 	switch (optname) {
-	case KTLS_GET_IV_RECV:
-		ret = tls_get_iv(tsk, 1, optval, len);
-		break;
-	case KTLS_GET_KEY_RECV:
-		ret = tls_get_key(tsk, 1, optval, len);
-		break;
-	case KTLS_GET_SALT_RECV:
-		ret = tls_get_salt(tsk, 1, optval, len);
-		break;
-	case KTLS_GET_IV_SEND:
-		ret = tls_get_iv(tsk, 0, optval, len);
-		break;
-	case KTLS_GET_KEY_SEND:
-		ret = tls_get_key(tsk, 0, optval, len);
-		break;
-	case KTLS_GET_SALT_SEND:
-		ret = tls_get_salt(tsk, 0, optval, len);
-		break;
-	case KTLS_GET_MTU:
-		if (len < sizeof(tsk->mtu_payload))
-			return -ENOMEM;
+		case KTLS_GET_IV_RECV:
+			ret = tls_get_iv(tsk, 1, optval, len);
+			break;
+		case KTLS_GET_KEY_RECV:
+			ret = tls_get_key(tsk, 1, optval, len);
+			break;
+		case KTLS_GET_SALT_RECV:
+			ret = tls_get_salt(tsk, 1, optval, len);
+			break;
+		case KTLS_GET_IV_SEND:
+			ret = tls_get_iv(tsk, 0, optval, len);
+			break;
+		case KTLS_GET_KEY_SEND:
+			ret = tls_get_key(tsk, 0, optval, len);
+			break;
+		case KTLS_GET_SALT_SEND:
+			ret = tls_get_salt(tsk, 0, optval, len);
+			break;
+		case KTLS_GET_MTU:
+			if (len < sizeof(tsk->mtu_payload)) {
+				ret = -ENOMEM;
+				goto end;
+			}
+			if (put_user(sizeof(tsk->mtu_payload), optlen)) {
+				ret = -EFAULT;
+				goto end;
+			}
+			mtu = KTLS_RECORD_SIZE(tsk, tsk->mtu_payload);
+			if (copy_to_user(optval, &mtu, sizeof(mtu))) {
+				ret = -EFAULT;
+				goto end;
+			}
 
-		if (put_user(sizeof(tsk->mtu_payload), optlen))
-			return -EFAULT;
-
-		mtu = KTLS_RECORD_SIZE(tsk, tsk->mtu_payload);
-		if (copy_to_user(optval, &mtu, sizeof(mtu)))
-			return -EFAULT;
-
-		return 0;
-	default:
-		ret = -EBADMSG;
-		break;
+			ret = 0;
+			goto end;
+		default:
+			ret = -EBADMSG;
+			break;
 	}
 
 	if (ret < 0)
@@ -1338,6 +1351,7 @@ static int tls_getsockopt(struct socket *sock,
 	ret = copy_to_user(optlen, &ret, sizeof(*optlen));
 
 end:
+	release_sock(sock->sk);
 	return ret;
 }
 
@@ -1648,7 +1662,6 @@ static int tls_recvmsg(struct socket *sock,
 	}
 
 	timeo = sock_rcvtimeo(&tsk->sk, flags & MSG_DONTWAIT);
-
 	do {
 		int chunk;
 		/*TODO: Consider helping with decryption */
@@ -1937,10 +1950,12 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		return -ENOENT;
 	}
 
+	lock_sock(sock->sk);
 	tsk->socket = sockfd_lookup(sa_ktls->sa_socket, &ret);
-	if (tsk->socket == NULL)
-		return -ENOENT;
-
+	if (tsk->socket == NULL) {
+		ret = -ENOENT;
+		goto bind_end;
+	}
 	if (!IS_TCP(tsk->socket) && !IS_UDP(tsk->socket)) {
 		ret = -EAFNOSUPPORT;
 		goto bind_end;
@@ -1996,11 +2011,13 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	 * if necessary
 	 */
 	do_tls_sock_rx_work(tsk);
+	release_sock(sock->sk);
 	return 0;
 
 bind_end:
 	sockfd_put(tsk->socket);
 	tsk->socket = NULL;
+	release_sock(sock->sk);
 	return ret;
 }
 
