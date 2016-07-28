@@ -28,6 +28,7 @@
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <linux/skbuff.h>
+#include <linux/log2.h>
 
 #include "af_ktls.h"
 
@@ -134,6 +135,17 @@
 						(KTLS_TLS_NONCE_OFFSET) : \
 						(KTLS_DTLS_NONCE_OFFSET))
 
+#define KTLS_PREPEND_SIZE(T)		(IS_TLS(T) ? \
+						(KTLS_TLS_PREPEND_SIZE) : \
+						(KTLS_DTLS_PREPEND_SIZE))
+
+#define KTLS_HEADER_SIZE(T)		(IS_TLS(T) ? \
+						(KTLS_TLS_HEADER_SIZE) : \
+						(KTLS_DTLS_HEADER_SIZE))
+
+#define KTLS_OVERHEAD(T)		(IS_TLS(T) ? \
+						(KTLS_TLS_OVERHEAD) : \
+						(KTLS_DTLS_OVERHEAD))
 
 /*#define KTLS_DEBUG */
 
@@ -1438,7 +1450,55 @@ static int tls_do_encryption(struct tls_sock *tsk,
 			&completion);
 }
 
-/*TODO: Avoid kernel_sendmsg */
+/*
+ * Allocates enough pages to hold the decrypted data, as well as
+ * setting tsk->sg_tx_data to the pages
+ * Return the log 2 of number of pages allocated, or -ENOMEM on failure
+ */
+static int tls_pre_encrypt(struct tls_sock *tsk, size_t data_len) {
+	int i;
+	unsigned npages;
+	unsigned order_npages;
+	size_t aligned_size;
+	size_t encrypt_len;
+	struct scatterlist *sg;
+	int ret = 0;
+
+	encrypt_len = data_len + KTLS_TAG_SIZE;
+	npages = encrypt_len / PAGE_SIZE;
+	aligned_size = npages * PAGE_SIZE;
+	if (aligned_size < encrypt_len)
+		npages++;
+
+	order_npages = order_base_2(npages);
+	WARN_ON(order_npages < 0 || order_npages > 3);
+	/*
+	 * The first entry in sg_tx_data is AAD so skip it
+	 */
+	sg_init_table(tsk->sg_tx_data, KTLS_SG_DATA_SIZE);
+	sg_set_buf(&tsk->sg_tx_data[0], tsk->aad_send, sizeof(tsk->aad_send));
+	tsk->pages_send = alloc_pages(GFP_KERNEL, order_npages);
+	if (!tsk->pages_send) {
+		ret = -ENOMEM;
+		goto bail;
+	}
+
+	sg = tsk->sg_tx_data + 1;
+	/*
+	 * For the first page, leave room for prepend. It will be copied
+	 * into the page later
+	 */
+	sg_set_page(sg, tsk->pages_send, PAGE_SIZE - KTLS_PREPEND_SIZE(tsk),
+			KTLS_PREPEND_SIZE(tsk));
+	for (i = 1; i < npages; i++)
+		sg_set_page(sg + i,
+				tsk->pages_send + i,
+				PAGE_SIZE, 0);
+	ret = order_npages;
+bail:
+	return ret;
+}
+
 static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 {
 	struct tls_sock *tsk;
@@ -1446,7 +1506,8 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	unsigned int cnt = 0;
 	int ret = 0;
 
-	xprintk("--> %s", __func__);
+	int order_npages = 0;
+	xprintk("--> %s", __FUNCTION__);
 
 	tsk = tls_sk(sock->sk);
 	lock_sock(sock->sk);
@@ -1486,20 +1547,49 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	sg_chain(tsk->sgl_send[cnt-1].sg, tsk->sgl_send[cnt-1].npages + 1,
 			tsk->sgtag_send);
 
+	ret = tls_pre_encrypt(tsk, size);
+	if (ret < 0) {
+		goto send_end;
+	}
+
+	order_npages = ret;
 	ret = tls_do_encryption(tsk, tsk->sgaad_send, tsk->sg_tx_data, size);
 	if (ret < 0)
-		goto send_end;
+		goto encrypt_failed;
 
-	tls_make_prepend(tsk, tsk->header_send, size);
-
-	ret = kernel_sendmsg(tsk->socket, msg, tsk->vec_send, KTLS_VEC_SIZE,
-			KTLS_RECORD_SIZE(tsk, size));
+	tls_make_prepend(tsk, page_address(tsk->pages_send), size);
+	/*
+	 * The whole record is sent in one go, instead of 3 separate calls
+	 * to kernel_sendpage. We don't want to deal with the situation
+	 * where sending the 1st part succeeded but 2nd part didn't, and
+	 * now there is half a record sitting in the tx queue with no real
+	 * way to clean it up. Most TLS implementations should be robust
+	 * enough to deal with this, though.
+	 */
+	ret = kernel_sendpage(tsk->socket,
+			tsk->pages_send,
+			/*offset*/ 0,
+			size + KTLS_OVERHEAD(tsk), msg->msg_flags);
 
 	if (ret > 0) {
 		increment_seqno(tsk->iv_send, tsk);
 		ret = size;
 	}
 
+/*
+ * I'm a little fuzzy on this, so can someone check if this is right?
+ * tls_pre_encrypt() allocates some order number of contiguous pages that
+ * are reference counted. kernel_sendpage calls get_page before attaching
+ * page to skb (e.g. tcp.c:938). __free_pages is called now and decreases the
+ * ref count to 1. When data is received (net_rx_action), tcp_clean_rtx_queue
+ * is called (tcp_input.c:3184) to take skb's off the retransmit queue,
+ * and calls kfree_skb which put_page's any paged fragments.
+ * At this point the pages are finally freed.
+ * So there _should_ be no leaked pages
+ *
+ */
+encrypt_failed:
+	__free_pages(tsk->pages_send, order_npages);
 send_end:
 	for (i = 0; i < cnt; i++)
 		af_alg_free_sg(&tsk->sgl_send[i]);
@@ -2132,8 +2222,6 @@ static void tls_sock_destruct(struct sock *sk)
 
 	crypto_free_aead(tsk->aead_recv);
 
-	if (tsk->pages_send)
-		__free_pages(tsk->pages_send, KTLS_DATA_PAGES);
 }
 
 static struct proto tls_proto = {
