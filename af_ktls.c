@@ -203,10 +203,10 @@ struct tls_sock {
 	/*
 	 * Context for {set,get}sockopt()
 	 */
-	char *iv_send;
+	unsigned char *iv_send;
 	struct tls_key key_send;
 
-	char *iv_recv;
+	unsigned char *iv_recv;
 	struct tls_key key_recv;
 
 	struct crypto_aead *aead_send;
@@ -302,15 +302,24 @@ static inline void tls_make_aad(struct tls_sock *tsk,
 		size_t size,
 		char *nonce_explicit);
 
-static int tls_post_process(const struct tls_sock *tsk, struct sk_buff *skb);
+static int tls_post_process(struct tls_sock *tsk, struct sk_buff *skb);
+static void tls_err_abort(struct tls_sock *tsk);
 
-static void increment_seqno(char *s)
+static void increment_seqno(unsigned char *seq, struct tls_sock *tsk)
 {
-	u64 *seqno = (u64 *) s;
-	u64 seq_h = be64_to_cpu(*seqno);
+	int i;
 
-	seq_h++;
-	*seqno = cpu_to_be64(seq_h);
+	for (i = 7; i >= 0; i--) {
+		++seq[i];
+		if (seq[i] != 0)
+			break;
+	}
+	/*
+	 * Check for overflow. If overflowed, connection must disconnect.
+	 * Raise an error and notify userspace.
+	 */
+	if (unlikely((IS_TLS(tsk) && i == -1) || (IS_DTLS(tsk) && i <= 1)))
+		tls_err_abort(tsk);
 }
 
 static void tls_free_sendpage_ctx(struct tls_sock *tsk)
@@ -971,7 +980,7 @@ static int tls_set_iv(struct socket *sock,
 		size_t src_len)
 {
 	int ret;
-	char **iv;
+	unsigned char **iv;
 	struct sock *sk;
 	struct tls_sock *tsk;
 
@@ -1487,7 +1496,7 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 			KTLS_RECORD_SIZE(tsk, size));
 
 	if (ret > 0) {
-		increment_seqno(tsk->iv_send);
+		increment_seqno(tsk->iv_send, tsk);
 		ret = size;
 	}
 
@@ -1525,7 +1534,7 @@ static int tls_do_decryption(const struct tls_sock *tsk,
 	return ret;
 }
 
-static int tls_post_process(const struct tls_sock *tsk, struct sk_buff *skb)
+static int tls_post_process(struct tls_sock *tsk, struct sk_buff *skb)
 {
 	size_t prepend, overhead;
 	struct tls_rx_msg *rxm;
@@ -1544,7 +1553,7 @@ static int tls_post_process(const struct tls_sock *tsk, struct sk_buff *skb)
 	 */
 	rxm->offset += prepend;
 	rxm->full_len -= overhead;
-	increment_seqno(tsk->iv_recv);
+	increment_seqno(tsk->iv_recv, tsk);
 	return 0;
 }
 
@@ -1690,7 +1699,6 @@ static int tls_recvmsg(struct socket *sock,
 	} while (len);
 
 recv_end:
-
 	release_sock(sock->sk);
 	ret = copied ? : err;
 	return ret;
@@ -1832,7 +1840,7 @@ static ssize_t tls_do_sendpage(struct tls_sock *tsk)
 	ret = kernel_sendmsg(tsk->socket, &msg, tsk->vec_send, KTLS_VEC_SIZE,
 			KTLS_RECORD_SIZE(tsk, data_len));
 	if (ret > 0) {
-		increment_seqno(tsk->iv_send);
+		increment_seqno(tsk->iv_send, tsk);
 		tls_update_senpage_ctx(tsk, data_len);
 	} else
 		tls_free_sendpage_ctx(tsk);
