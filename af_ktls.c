@@ -302,7 +302,8 @@ static inline void tls_make_aad(struct tls_sock *tsk,
 		size_t size,
 		char *nonce_explicit);
 
-static int tls_post_process(const struct tls_sock *tsk, struct sk_buff *skb);
+static int tls_post_process(struct tls_sock *tsk, struct sk_buff *skb);
+static void tls_err_abort(struct tls_sock *tsk);
 
 static void increment_seqno(unsigned char *seq, struct tls_sock *tsk)
 {
@@ -1533,7 +1534,7 @@ static int tls_do_decryption(const struct tls_sock *tsk,
 	return ret;
 }
 
-static int tls_post_process(const struct tls_sock *tsk, struct sk_buff *skb)
+static int tls_post_process(struct tls_sock *tsk, struct sk_buff *skb)
 {
 	size_t prepend, overhead;
 	struct tls_rx_msg *rxm;
@@ -1552,7 +1553,7 @@ static int tls_post_process(const struct tls_sock *tsk, struct sk_buff *skb)
 	 */
 	rxm->offset += prepend;
 	rxm->full_len -= overhead;
-	increment_seqno(tsk->iv_recv);
+	increment_seqno(tsk->iv_recv, tsk);
 	return 0;
 }
 
@@ -1697,22 +1698,7 @@ static int tls_recvmsg(struct socket *sock,
 
 	} while (len);
 
-<<<<<<< f3831318df4debcf6cd5e2a846470000aa9b98fc
 recv_end:
-=======
-	if (ret > 0) {
-		increment_seqno(tsk->iv_recv, tsk);
-		tls_pop_record(tsk, data_len);
-	}
-
-splice_read_end:
-	// restore chaining for receiving
-	sg_chain(tsk->sgaad_recv, 2, tsk->sgl_recv[0].sg);
-
-	if (ret > 0)
-		queue_work(tls_wq, &tsk->recv_work);
->>>>>>> Added check for wrap around. Requires buffer revamp patch for tls_err_abort() to be defined
-
 	release_sock(sock->sk);
 	ret = copied ? : err;
 	return ret;
@@ -1804,17 +1790,12 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 	if (!skb)
 		goto splice_read_end;
 
-<<<<<<< f3831318df4debcf6cd5e2a846470000aa9b98fc
 	rxm = tls_rx_msg(skb);
 	chunk = min_t(unsigned int, rxm->full_len, len);
 	copied = skb_splice_bits(skb, sk, rxm->offset, pipe, chunk,
 			flags, tls_sock_splice);
 	if (ret < 0)
 		goto splice_read_end;
-=======
-	tls_pop_record(tsk, ret);
-	increment_seqno(tsk->iv_recv, tsk);
->>>>>>> Added check for wrap around. Requires buffer revamp patch for tls_err_abort() to be defined
 
 	rxm->offset += copied;
 	rxm->full_len -= copied;
