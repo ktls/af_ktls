@@ -28,6 +28,7 @@
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <linux/skbuff.h>
+#include <linux/log2.h>
 
 #include "af_ktls.h"
 
@@ -2133,7 +2134,7 @@ static void tls_sock_destruct(struct sock *sk)
 	crypto_free_aead(tsk->aead_recv);
 
 	if (tsk->pages_send)
-		__free_pages(tsk->pages_send, KTLS_DATA_PAGES);
+		__free_pages(tsk->pages_send, order_base_2(KTLS_DATA_PAGES));
 }
 
 static struct proto tls_proto = {
@@ -2209,7 +2210,7 @@ static int tls_create(struct net *net,
 	 */
 	sg_init_table(tsk->sg_tx_data, KTLS_SG_DATA_SIZE);
 	sg_set_buf(&tsk->sg_tx_data[0], tsk->aad_send, sizeof(tsk->aad_send));
-	tsk->pages_send = alloc_pages(GFP_KERNEL, KTLS_DATA_PAGES);
+	tsk->pages_send = alloc_pages(GFP_KERNEL, order_base_2(KTLS_DATA_PAGES));
 	if (!tsk->pages_send)
 		goto create_error;
 	for (i = 0; i < KTLS_DATA_PAGES; i++)
