@@ -2134,6 +2134,8 @@ static void tls_sock_destruct(struct sock *sk)
 
 	if (tsk->pages_send)
 		__free_pages(tsk->pages_send, KTLS_DATA_PAGES);
+	skb_queue_purge(&sk->sk_receive_queue);
+
 }
 
 static struct proto tls_proto = {
