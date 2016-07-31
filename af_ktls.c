@@ -828,7 +828,18 @@ static void tls_data_ready(struct sock *sk)
 	if (unlikely(!tsk || tsk->rx_stopped))
 		goto out;
 
-	if (!KTLS_RECV_READY(tsk)) {
+	/* Socket locks are weird. Basically it uses
+	 * sk_lock.owned as a sleeper semaphore
+	 * to protect against process-context accesses.
+	 * The semaphore is set on calls to lock_sock.
+	 * But a thread that called bh_lock_sock (such
+	 * as data_ready) can still run when another
+	 * thread acquired lock_sock. Therefore if we
+	 * see that the semaphore is raised, we exit
+	 * since tcp_read_sock requires calls to be
+	 * synchronized
+	 */
+	if (sk->sk_lock.owned || !KTLS_RECV_READY(tsk)) {
 		queue_work(tls_wq, &tsk->recv_work);
 		goto out;
 	}
@@ -949,7 +960,7 @@ static void do_tls_sock_rx_work(struct tls_sock *tsk)
 	lock_sock(sk);
 	read_lock_bh(&sk->sk_callback_lock);
 
-	if (unlikely(sk->sk_user_data != tsk))
+	if (unlikely(!tsk || sk->sk_user_data != tsk))
 		goto out;
 
 	if (unlikely(tsk->rx_stopped))
