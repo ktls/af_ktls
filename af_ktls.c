@@ -785,6 +785,76 @@ parse_fail:
 	goto done;
 }
 
+static int tls_tcp_read_sock(struct tls_sock *tsk)
+{
+	read_descriptor_t desc;
+
+	desc.arg.data = tsk;
+	desc.error = 0;
+	desc.count = 1; /* give more than one skb per call */
+
+	/* sk should be locked here, so okay to do tcp_read_sock */
+	tcp_read_sock(tsk->socket->sk, &desc, tls_tcp_recv);
+
+	return desc.error;
+}
+
+static void do_tls_data_ready(struct tls_sock *tsk)
+{
+	int ret;
+
+	if (tsk->rx_need_bytes) {
+		if (tcp_inq(tsk->socket->sk) >= tsk->rx_need_bytes)
+			tsk->rx_need_bytes = 0;
+		else
+			return;
+	}
+
+	ret = tls_tcp_read_sock(tsk);
+	if (ret == -ENOMEM) /* No memory. Do it later */
+		queue_work(tls_wq, &tsk->recv_work);
+	/*queue_delayed_work(tls_wq, &tsk->recv_work, 0); */
+
+	/* TLS couldn't handle this message. Pass it directly to userspace */
+	else if (ret == -EBADMSG)
+		tls_err_abort(tsk);
+
+}
+
+/* Called with lower socket held */
+static void tls_data_ready(struct sock *sk)
+{
+	struct tls_sock *tsk;
+
+	xprintk("--> %s", __func__);
+
+	read_lock_bh(&sk->sk_callback_lock);
+	//TODO: forgot to lock tsk?
+	tsk = (struct tls_sock *)sk->sk_user_data;
+	if (unlikely(!tsk || tsk->rx_stopped))
+		goto out;
+
+	/* Socket locks are weird. Basically it uses
+	 * sk_lock.owned as a sleeper semaphore
+	 * to protect against process-context accesses.
+	 * The semaphore is set on calls to lock_sock.
+	 * But a thread that called bh_lock_sock (such
+	 * as data_ready) can still run when another
+	 * thread acquired lock_sock. Therefore if we
+	 * see that the semaphore is raised, we exit
+	 * since tcp_read_sock requires calls to be
+	 * synchronized
+	 */
+	if (sk->sk_lock.owned || !KTLS_RECV_READY(tsk)) {
+		queue_work(tls_wq, &tsk->recv_work);
+		goto out;
+	}
+
+	do_tls_data_ready(tsk);
+
+out:
+	read_unlock_bh(&sk->sk_callback_lock);
+}
 
 #include "dtls-window.c"
 
@@ -844,41 +914,6 @@ record_pop:
 
 }
 
-static int tls_tcp_read_sock(struct tls_sock *tsk)
-{
-	read_descriptor_t desc;
-
-	desc.arg.data = tsk;
-	desc.error = 0;
-	desc.count = 1; /* give more than one skb per call */
-
-	/* sk should be locked here, so okay to do tcp_read_sock */
-	tcp_read_sock(tsk->socket->sk, &desc, tls_tcp_recv);
-
-	return desc.error;
-}
-
-static void do_tls_data_ready(struct tls_sock *tsk)
-{
-	int ret;
-
-	if (tsk->rx_need_bytes) {
-		if (tcp_inq(tsk->socket->sk) >= tsk->rx_need_bytes)
-			tsk->rx_need_bytes = 0;
-		else
-			return;
-	}
-
-	ret = tls_tcp_read_sock(tsk);
-	if (ret == -ENOMEM) /* No memory. Do it later */
-		queue_work(tls_wq, &tsk->recv_work);
-
-	/* TLS couldn't handle this message. Pass it directly to userspace */
-	else if (ret == -EBADMSG)
-		tls_err_abort(tsk);
-
-}
-
 static void do_dtls_data_ready(struct tls_sock *tsk)
 {
 	int ret;
@@ -892,50 +927,6 @@ static void do_dtls_data_ready(struct tls_sock *tsk)
 		tls_err_abort(tsk);
 }
 
-/* Called with lower socket held */
-static void tls_data_ready(struct sock *sk)
-{
-	struct tls_sock *tsk;
-
-	xprintk("--> %s", __func__);
-
-	read_lock_bh(&sk->sk_callback_lock);
-	tsk = (struct tls_sock *)sk->sk_user_data;
-	/*
-	 * TLS socket is unattached. by user. Shouldn't
-	 * ever happen, since tls_unattach sets tsk
-	 * atomically with respect sk_callback_lock.
-	 */
-	if (unlikely(!tsk))
-		goto out;
-
-	/*
-	 * A previous call to tls_data_ready
-	 * encountered non-TLS message during parsing.
-	 * However, couldn't reset the callback at that
-	 * time, since tls_data_ready acquires the read
-	 * lock, not write lock. Therefore, it atomically
-	 * sets a boolean
-	 * Userspace is responsible for unattaching
-	 * the TLS socket so that callbacks don't
-	 * enter here, but until then, just call the
-	 * original callback.
-	 */
-	if (unlikely(tsk->rx_stopped)) {
-		tsk->saved_sk_data_ready(tsk->socket->sk);
-		goto out;
-	}
-
-	if (IS_TLS(tsk))
-		do_tls_data_ready(tsk);
-	else
-		do_dtls_data_ready(tsk);
-
-out:
-	read_unlock_bh(&sk->sk_callback_lock);
-}
-
-
 static void do_tls_sock_rx_work(struct tls_sock *tsk)
 {
 	struct sock *sk = tsk->socket->sk;
@@ -947,7 +938,26 @@ static void do_tls_sock_rx_work(struct tls_sock *tsk)
 	 *
 	 */
 	lock_sock(sk);
-	tls_data_ready(sk);
+	read_lock_bh(&sk->sk_callback_lock);
+
+	if (unlikely(!tsk || sk->sk_user_data != tsk))
+		goto out;
+
+	if (unlikely(tsk->rx_stopped))
+		goto out;
+
+	if (!KTLS_RECV_READY(tsk)) {
+		queue_work(tls_wq, &tsk->recv_work);
+		goto out;
+	}
+
+	if (IS_TLS(tsk))
+		do_tls_data_ready(tsk);
+	else
+		do_dtls_data_ready(tsk);
+
+out:
+	read_unlock_bh(&sk->sk_callback_lock);
 	release_sock(sk);
 }
 
