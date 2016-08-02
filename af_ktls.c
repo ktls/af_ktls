@@ -834,25 +834,9 @@ static void tls_data_ready(struct sock *sk)
 	if (unlikely(!tsk || tsk->rx_stopped))
 		goto out;
 
-	/* Socket locks are weird. Basically it uses
-	 * sk_lock.owned as a sleeper semaphore
-	 * to protect against process-context accesses.
-	 * The semaphore is set on calls to lock_sock.
-	 * But a thread that called bh_lock_sock (such
-	 * as data_ready) can still run when another
-	 * thread acquired lock_sock. Therefore if we
-	 * see that the semaphore is raised, we exit
-	 * since tcp_read_sock requires calls to be
-	 * synchronized
-	 */
-	if (sk->sk_lock.owned || !KTLS_RECV_READY(tsk)) {
-		queue_work(tls_wq, &tsk->recv_work);
-		goto out;
-	}
+	queue_work(tls_wq, &tsk->recv_work);
 
-	do_tls_data_ready(tsk);
-
-out:
+	out:
 	read_unlock_bh(&sk->sk_callback_lock);
 }
 
@@ -2030,6 +2014,7 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	tsk->socket->sk->sk_user_data = tsk;
 	write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
 
+	release_sock(sock->sk);
 	/* Check if any TLS packets have come in between the time the
 	 * handshake was completed and bin() was called. If there were,
 	 * the packets would have woken up TCP socket waiters, not
@@ -2037,7 +2022,7 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	 * if necessary
 	 */
 	do_tls_sock_rx_work(tsk);
-	release_sock(sock->sk);
+
 	return 0;
 
 bind_end:
