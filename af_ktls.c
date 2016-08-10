@@ -188,6 +188,7 @@ struct tls_rx_msg {
 	int accum_len;
 	int offset;
 	int early_eaten;
+	int decrypted;
 };
 
 struct tls_sock {
@@ -284,8 +285,7 @@ struct tls_sock {
 
 static inline struct tls_rx_msg *tls_rx_msg(struct sk_buff *skb)
 {
-	return (struct tls_rx_msg *)((void *)skb->cb +
-				     offsetof(struct qdisc_skb_cb, data));
+	return (struct tls_rx_msg *)((void *)skb->cb);
 }
 static inline struct tls_sock *tls_sk(struct sock *sk)
 {
@@ -295,6 +295,7 @@ static inline struct tls_sock *tls_sk(struct sock *sk)
 static int tls_do_decryption(const struct tls_sock *tsk,
 		struct scatterlist *sgin,
 		struct scatterlist *sgout,
+		char *header_recv,
 		size_t data_len);
 
 static inline void tls_make_aad(struct tls_sock *tsk,
@@ -398,8 +399,10 @@ static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
 /*Must be called with socket callback locked */
 static void tls_unattach(struct tls_sock *tsk)
 {
+	write_lock_bh(&tsk->socket->sk->sk_callback_lock);
 	tsk->socket->sk->sk_data_ready = tsk->saved_sk_data_ready;
 	tsk->socket->sk->sk_user_data = NULL;
+	write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
 }
 
 static void tls_err_abort(struct tls_sock *tsk)
@@ -407,11 +410,10 @@ static void tls_err_abort(struct tls_sock *tsk)
 	struct sock *sk;
 
 	sk = (struct sock *)tsk;
-	tsk->rx_stopped = 1;
-	sk->sk_err = -EBADMSG;
+	xchg(&tsk->rx_stopped, 1);
+	xchg(&sk->sk_err, -EBADMSG);
 	sk->sk_error_report(sk);
 	tsk->saved_sk_data_ready(tsk->socket->sk);
-	tls_unattach(tsk);
 }
 
 static int decrypt_skb(struct tls_sock *tsk, struct sk_buff *skb)
@@ -419,11 +421,20 @@ static int decrypt_skb(struct tls_sock *tsk, struct sk_buff *skb)
 	int ret, nsg;
 	size_t prepend, overhead;
 	struct tls_rx_msg *rxm;
+	char header_recv[MAX(KTLS_TLS_PREPEND_SIZE, KTLS_DTLS_PREPEND_SIZE)];
 
 	prepend = IS_TLS(tsk) ? KTLS_TLS_PREPEND_SIZE : KTLS_DTLS_PREPEND_SIZE;
 	overhead = IS_TLS(tsk) ? KTLS_TLS_OVERHEAD : KTLS_DTLS_OVERHEAD;
 	rxm = tls_rx_msg(skb);
 
+	/* Copy header to pass into decryption routine.
+	 * Cannot use tsk->header_recv as that would cause
+	 * a race between here and data_ready
+	 */
+	ret = skb_copy_bits(skb, rxm->offset, header_recv, prepend);
+
+	if (ret < 0)
+		goto decryption_fail;
 
 	sg_init_table(tsk->sgin, ARRAY_SIZE(tsk->sgin));
 	sg_set_buf(&tsk->sgin[0], tsk->aad_recv, sizeof(tsk->aad_recv));
@@ -463,6 +474,7 @@ static int decrypt_skb(struct tls_sock *tsk, struct sk_buff *skb)
 	ret = tls_do_decryption(tsk,
 			tsk->sgin,
 			tsk->sgin,
+			header_recv,
 			rxm->full_len - overhead);
 
 	if (ret < 0)
@@ -529,14 +541,13 @@ static inline ssize_t tls_read_size(struct tls_sock *tsk, struct sk_buff *skb)
 	}
 
 	/*
-	 *Copy header to use later in decryption.
+	 *Copy header to read size.
 	 *An optimization could be to zero-copy, but you'd
 	 *have to be able to walk frag_lists. This function call
 	 *takes care of that.
 	 *Overhead is relatively small (13 bytes for TLS, 21 for DTLS)
 	 */
-	ret = skb_copy_bits(skb, rxm->offset, tsk->header_recv,
-			prepend);
+	ret = skb_copy_bits(skb, rxm->offset, header, prepend);
 
 	if (ret < 0)
 		goto read_failure;
@@ -655,7 +666,6 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 	}
 
 	while (eaten < orig_len) {
-		int ret;
 		/* Always clone since we will consume something */
 		skb = skb_clone(orig_skb, GFP_ATOMIC);
 		if (!skb) {
@@ -703,13 +713,13 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 				/* Data does not appear to be a TLS record
 				 * Make userspace handle it
 				 */
-				goto decryption_fail;
+				goto parse_fail;
 			} else if (len <= (ssize_t)head->len -
 					  skb->len - rxm->offset) {
 				/* Length must be into new skb (and also
 				 * greater than zero)
 				 */
-				goto decryption_fail;
+				goto parse_fail;
 			}
 
 			rxm->full_len = len;
@@ -757,10 +767,6 @@ static int tls_tcp_recv(read_descriptor_t *desc, struct sk_buff *orig_skb,
 
 		WARN_ON(extra > uneaten);
 
-		ret = decrypt_skb(tsk, head);
-		if (ret < 0)
-			goto decryption_fail;
-
 		/* Hurray, we have a new message! */
 		tsk->rx_skb_head = NULL;
 		eaten += (uneaten - extra);
@@ -771,7 +777,7 @@ done:
 	if (cloned_orig)
 		kfree_skb(orig_skb);
 	return eaten;
-decryption_fail:
+parse_fail:
 	kfree_skb(skb);
 	desc->error = -EBADMSG;
 	tsk->rx_skb_head = NULL;
@@ -828,14 +834,9 @@ static void tls_data_ready(struct sock *sk)
 	if (unlikely(!tsk || tsk->rx_stopped))
 		goto out;
 
-	if (!KTLS_RECV_READY(tsk)) {
-		queue_work(tls_wq, &tsk->recv_work);
-		goto out;
-	}
+	queue_work(tls_wq, &tsk->recv_work);
 
-	do_tls_data_ready(tsk);
-
-out:
+	out:
 	read_unlock_bh(&sk->sk_callback_lock);
 }
 
@@ -888,15 +889,7 @@ static int dtls_udp_read_sock(struct tls_sock *tsk)
 			ret = -ENOMEM;
 			break;
 		}
-		ret = decrypt_skb(tsk, skb);
-
-		if (ret < 0)
-			goto decryption_fail;
-
 		sock_queue_rcv_skb((struct sock *)tsk, skb);
-		goto record_pop;
-decryption_fail:
-		kfree_skb(skb);
 record_pop:
 		skb_unlink(p, &tsk->socket->sk->sk_receive_queue);
 		kfree_skb(p);
@@ -912,44 +905,26 @@ static void do_dtls_data_ready(struct tls_sock *tsk)
 	ret = dtls_udp_read_sock(tsk);
 	if (ret == -ENOMEM) /* No memory. Do it later */
 		queue_work(tls_wq, &tsk->recv_work);
-	/*queue_delayed_work(tls_wq, &tsk->recv_work, 0); */
+
 	/* TLS couldn't handle this message. Pass it directly to userspace */
 	else if (ret == -EBADMSG)
 		tls_err_abort(tsk);
-}
-/* Called with lower socket held */
-static void dtls_data_ready(struct sock *sk)
-{
-	struct tls_sock *tsk;
-	xprintk("--> %s", __func__);
-
-	read_lock_bh(&sk->sk_callback_lock);
-
-	tsk = (struct tls_sock *)sk->sk_user_data;
-	if (unlikely(!tsk || tsk->rx_stopped))
-		goto out;
-
-	if (!KTLS_RECV_READY(tsk)) {
-		queue_work(tls_wq, &tsk->recv_work);
-		goto out;
-	}
-
-	do_dtls_data_ready(tsk);
-out:
-	read_unlock_bh(&sk->sk_callback_lock);
 }
 
 static void do_tls_sock_rx_work(struct tls_sock *tsk)
 {
 	struct sock *sk = tsk->socket->sk;
 
-	/* We need the read lock to synchronize with tls_sock_tcp_data_ready.
+	/*
 	 * We need the socket lock for calling tcp_read_sock.
+	 * It's not needed in tls_data_ready because tcp layers
+	 * call the cb with the lock already held
+	 *
 	 */
 	lock_sock(sk);
 	read_lock_bh(&sk->sk_callback_lock);
 
-	if (unlikely(sk->sk_user_data != tsk))
+	if (unlikely(!tsk || sk->sk_user_data != tsk))
 		goto out;
 
 	if (unlikely(tsk->rx_stopped))
@@ -1153,9 +1128,7 @@ static void tls_do_unattach(struct socket *sock)
 	tsk = tls_sk(sock->sk);
 	sk = tsk->socket->sk;
 
-	read_lock_bh(&sk->sk_callback_lock);
-	tls_err_abort(tsk);
-	read_unlock_bh(&sk->sk_callback_lock);
+	tls_unattach(tsk);
 }
 static int tls_setsockopt(struct socket *sock,
 		int level, int optname,
@@ -1511,6 +1484,7 @@ send_end:
 static int tls_do_decryption(const struct tls_sock *tsk,
 		struct scatterlist *sgin,
 		struct scatterlist *sgout,
+		char *header_recv,
 		size_t data_len)
 {
 	int ret;
@@ -1526,7 +1500,7 @@ static int tls_do_decryption(const struct tls_sock *tsk,
 	aead_request_set_ad(aead_req, KTLS_PADDED_AAD_SIZE);
 	aead_request_set_crypt(aead_req, sgin, sgout,
 			data_len + KTLS_TAG_SIZE,
-			       (u8 *)tsk->header_recv + KTLS_NONCE_OFFSET(tsk));
+			       (u8 *)header_recv + KTLS_NONCE_OFFSET(tsk));
 
 	ret = af_alg_wait_for_completion(
 			crypto_aead_decrypt(aead_req),
@@ -1555,6 +1529,7 @@ static int tls_post_process(struct tls_sock *tsk, struct sk_buff *skb)
 	rxm->offset += prepend;
 	rxm->full_len -= overhead;
 	increment_seqno(tsk->iv_recv, tsk);
+	rxm->decrypted = 1;
 	return 0;
 }
 
@@ -1674,11 +1649,23 @@ static int tls_recvmsg(struct socket *sock,
 	timeo = sock_rcvtimeo(&tsk->sk, flags & MSG_DONTWAIT);
 	do {
 		int chunk;
-		/*TODO: Consider helping with decryption */
 		skb = tls_wait_data(tsk, flags, timeo, &err);
 		if (!skb)
 			goto recv_end;
+
 		rxm = tls_rx_msg(skb);
+		/* It is possible that the message is already
+		 * decrypted if the last call only read
+		 * part of the message
+		 */
+		if (!rxm->decrypted) {
+			err = decrypt_skb(tsk, skb);
+			if (err < 0) {
+				tls_err_abort(tsk);
+				goto recv_end;
+			}
+			rxm->decrypted = 1;
+		}
 		chunk = min_t(unsigned int, rxm->full_len, len);
 		err = skb_copy_datagram_msg(skb, rxm->offset, msg, chunk);
 		if (err < 0)
@@ -1732,6 +1719,11 @@ static int dtls_recvmsg(struct socket *sock,
 	if (!skb)
 		goto recv_end;
 	rxm = tls_rx_msg(skb);
+	err = decrypt_skb(tsk, skb);
+	if (err < 0) {
+		tls_err_abort(tsk);
+		goto recv_end;
+	}
 	err = skb_copy_datagram_msg(skb, rxm->offset, msg, rxm->full_len);
 	if (err < 0)
 		goto recv_end;
@@ -1792,6 +1784,18 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 		goto splice_read_end;
 
 	rxm = tls_rx_msg(skb);
+	/* It is possible that the message is already
+	 * decrypted if the last call only read
+	 * part of the message
+	 */
+	if (!rxm->decrypted) {
+		err = decrypt_skb(tsk, skb);
+		if (err < 0) {
+			tls_err_abort(tsk);
+			goto splice_read_end;
+		}
+		rxm->decrypted = 1;
+	}
 	chunk = min_t(unsigned int, rxm->full_len, len);
 	copied = skb_splice_bits(skb, sk, rxm->offset, pipe, chunk,
 			flags, tls_sock_splice);
@@ -2006,13 +2010,11 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	write_lock_bh(&tsk->socket->sk->sk_callback_lock);
 	tsk->rx_stopped = 0;
 	tsk->saved_sk_data_ready = tsk->socket->sk->sk_data_ready;
-	if (IS_TLS(tsk))
-		tsk->socket->sk->sk_data_ready = tls_data_ready;
-	else
-		tsk->socket->sk->sk_data_ready = dtls_data_ready;
+	tsk->socket->sk->sk_data_ready = tls_data_ready;
 	tsk->socket->sk->sk_user_data = tsk;
 	write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
 
+	release_sock(sock->sk);
 	/* Check if any TLS packets have come in between the time the
 	 * handshake was completed and bin() was called. If there were,
 	 * the packets would have woken up TCP socket waiters, not
@@ -2020,7 +2022,7 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	 * if necessary
 	 */
 	do_tls_sock_rx_work(tsk);
-	release_sock(sock->sk);
+
 	return 0;
 
 bind_end:
