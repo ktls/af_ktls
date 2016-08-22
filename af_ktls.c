@@ -137,41 +137,6 @@
 						(KTLS_DTLS_NONCE_OFFSET))
 
 
-/*#define KTLS_DEBUG */
-
-#if 1 /* TODO: remove once ready to use */
-	#ifdef KTLS_DEBUG
-	# define xprintk(...)  (do_xprintk(__VA_ARGS__))
-	# define print_hex(...) (do_print_hex(__VA_ARGS__))
-	#else
-	# define xprintk(...)  ((void) 0)
-	# define print_hex(...) ((void) 0)
-	#endif
-
-	#define UNUSED(X)		((void) X)
-
-	void do_xprintk(const char *fmt, ...)
-	{
-		va_list va;
-
-		va_start(va, fmt);
-		pr_debug("tls: ");
-		vprintk(fmt, va);
-		pr_debug("\n");
-		va_end(va);
-	}
-
-	void do_print_hex(const unsigned char *key, unsigned int keysize)
-	{
-		int i = 0;
-
-		pr_debug("kdls: hex: ");
-		for (i = 0; i < keysize; i++)
-			pr_debug("%02X", (unsigned char)key[i]);
-		pr_debug("\n");
-	}
-#endif
-
 /*
  * Async rx worker
  */
@@ -272,9 +237,6 @@ struct tls_sock {
 		size_t desired_size;
 		struct page *page;
 	} sendpage_ctx;
-
-	/* TODO: remove once finished benchmarking */
-	unsigned parallel_count_stat;
 };
 
 struct tls_rx_msg {
@@ -331,8 +293,6 @@ static void tls_free_sendpage_ctx(struct tls_sock *tsk)
 	size_t i;
 	struct scatterlist *sg;
 
-	xprintk("--> %s", __func__);
-
 	sg = tsk->sendpage_ctx.sg;
 
 	for (i = 0; i < tsk->sendpage_ctx.used; i++) {
@@ -357,8 +317,6 @@ static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
 	size_t put_count;
 	struct scatterlist *sg;
 	struct scatterlist *sg_start;
-
-	xprintk("--> %s", __func__);
 
 	sg = tsk->sendpage_ctx.sg;
 
@@ -504,7 +462,6 @@ decryption_fail:
  * Returns the length of the unencrypted message, plus overhead
  * Note that this function also populates tsk->header which is later
  * used for decryption
- * TODO: Revisit
  * In TLS we automatically bail if we see a non-TLS message. In DTLS
  * we should determine if we got a corrupted message vs a control msg
  * Right now if the TLS magic bit got corrupted it would incorrectly
@@ -524,7 +481,6 @@ static inline ssize_t tls_read_size(struct tls_sock *tsk, struct sk_buff *skb)
 
 	prepend = IS_TLS(tsk) ? KTLS_TLS_PREPEND_SIZE : KTLS_DTLS_PREPEND_SIZE;
 	header = tsk->header_recv;
-	xprintk("--> %s", __func__);
 
 	rxm = strp_rx_msg(skb);
 
@@ -620,8 +576,6 @@ static void tls_data_ready(struct sock *sk)
 {
 	struct tls_sock *tsk;
 
-	xprintk("--> %s", __func__);
-
 	read_lock_bh(&sk->sk_callback_lock);
 
 	tsk = (struct tls_sock *)sk->sk_user_data;
@@ -669,9 +623,6 @@ static int dtls_udp_read_sock(struct tls_sock *tsk)
 			if (len == -EBADMSG) {
 				/* Data does not appear to be a TLS record
 				 * Make userspace handle it
-				 * TODO: Of course, we are using DTLS therefore
-				 * it may be that the headers were corrupted
-				 *
 				 */
 				ret = -EBADMSG;
 				break;
@@ -756,8 +707,6 @@ static int tls_set_iv(struct socket *sock,
 	struct sock *sk;
 	struct tls_sock *tsk;
 
-	xprintk("--> %s", __func__);
-
 	sk = sock->sk;
 	tsk = tls_sk(sk);
 
@@ -788,8 +737,6 @@ static int tls_init_aead(struct tls_sock *tsk, int recv)
 	char keyval[KTLS_KEY_SIZE + KTLS_SALT_SIZE];
 	size_t keyval_len;
 
-	xprintk("--> %s", __func__);
-
 	k = recv ? &tsk->key_recv : &tsk->key_send;
 	aead = recv ? tsk->aead_recv : tsk->aead_send;
 
@@ -815,7 +762,6 @@ init_aead_end:
 	return ret ?: 0;
 }
 
-/*TODO: No lock? */
 static int tls_set_key(struct socket *sock,
 		int recv,
 		char __user *src,
@@ -824,8 +770,6 @@ static int tls_set_key(struct socket *sock,
 	int ret;
 	struct tls_sock *tsk;
 	struct tls_key *k;
-
-	xprintk("--> %s", __func__);
 
 	tsk = tls_sk(sock->sk);
 
@@ -865,8 +809,6 @@ static int tls_set_salt(struct socket *sock,
 	struct tls_sock *tsk;
 	struct tls_key *k;
 
-	xprintk("--> %s", __func__);
-
 	tsk = tls_sk(sock->sk);
 
 	k = recv ? &tsk->key_recv : &tsk->key_send;
@@ -891,8 +833,6 @@ static int tls_set_mtu(struct socket *sock, char __user *src, size_t src_len)
 	int ret;
 	size_t mtu;
 	struct tls_sock *tsk;
-
-	xprintk("--> %s", __func__);
 
 	tsk = tls_sk(sock->sk);
 
@@ -933,8 +873,6 @@ static int tls_setsockopt(struct socket *sock,
 {
 	int ret;
 	struct tls_sock *tsk;
-
-	xprintk("--> %s", __func__);
 
 	tsk = tls_sk(sock->sk);
 	if (level != AF_KTLS)
@@ -990,8 +928,6 @@ static int tls_get_iv(const struct tls_sock *tsk,
 	int ret;
 	char *iv;
 
-	xprintk("--> %s", __func__);
-
 	if (dst_len < KTLS_IV_SIZE)
 		return -ENOMEM;
 
@@ -1015,8 +951,6 @@ static int tls_get_key(const struct tls_sock *tsk,
 	int ret;
 	const struct tls_key *k;
 
-	xprintk("--> %s", __func__);
-
 	k = recv ? &tsk->key_recv : &tsk->key_send;
 
 	if (k->keylen == 0)
@@ -1037,8 +971,6 @@ static int tls_get_salt(const struct tls_sock *tsk,
 {
 	int ret;
 	const struct tls_key *k;
-
-	xprintk("--> %s", __func__);
 
 	k = recv ? &tsk->key_recv : &tsk->key_send;
 
@@ -1063,8 +995,6 @@ static int tls_getsockopt(struct socket *sock,
 	int len;
 	size_t mtu;
 	const struct tls_sock *tsk;
-
-	xprintk("--> %s", __func__);
 
 	tsk = tls_sk(sock->sk);
 
@@ -1140,8 +1070,6 @@ static inline void tls_make_prepend(struct tls_sock *tsk,
 {
 	size_t pkt_len;
 
-	xprintk("--> %s", __func__);
-
 	pkt_len = plaintext_len + KTLS_IV_SIZE + KTLS_TAG_SIZE;
 
 	/*
@@ -1172,8 +1100,6 @@ static inline void tls_make_aad(struct tls_sock *tsk,
 		size_t size,
 		char *nonce_explicit)
 {
-	xprintk("--> %s", __func__);
-
 	/* has to be zero padded according to RFC5288 */
 	memset(buf, 0, KTLS_AAD_SPACE_SIZE);
 
@@ -1197,8 +1123,6 @@ static int tls_do_encryption(struct tls_sock *tsk,
 	struct aead_request *aead_req = (void *)aead_req_data;
 	struct af_alg_completion completion;
 
-	xprintk("--> %s", __func__);
-
 	aead_request_set_tfm(aead_req, tsk->aead_send);
 	aead_request_set_ad(aead_req, KTLS_PADDED_AAD_SIZE);
 	aead_request_set_crypt(aead_req, sgin, sgout, data_len, tsk->iv_send);
@@ -1215,8 +1139,6 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	unsigned int i;
 	unsigned int cnt = 0;
 	int ret = 0;
-
-	xprintk("--> %s", __func__);
 
 	tsk = tls_sk(sock->sk);
 	lock_sock(sock->sk);
@@ -1289,8 +1211,6 @@ static int tls_do_decryption(const struct tls_sock *tsk,
 		__aligned(__alignof__(struct aead_request));
 	struct aead_request *aead_req = (void *)aead_req_data;
 	struct af_alg_completion completion;
-
-	xprintk("--> %s", __func__);
 
 	aead_request_set_tfm(aead_req, tsk->aead_recv);
 	aead_request_set_ad(aead_req, KTLS_PADDED_AAD_SIZE);
@@ -1451,8 +1371,6 @@ static int tls_recvmsg(struct socket *sock,
 	int ret = 0;
 	struct sk_buff *skb;
 
-	xprintk("--> %s", __func__);
-
 	tsk = tls_sk(sock->sk);
 	lock_sock(sock->sk);
 
@@ -1520,8 +1438,6 @@ static int dtls_recvmsg(struct socket *sock,
 	int ret = 0;
 	struct sk_buff *skb;
 
-	xprintk("--> %s", __func__);
-
 	tsk = tls_sk(sock->sk);
 	lock_sock(sock->sk);
 
@@ -1584,8 +1500,6 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 	int err = 0;
 	struct sock *sk = sock->sk;
 
-	xprintk("--> %s", __func__);
-
 	tsk = tls_sk(sk);
 	lock_sock(sk);
 
@@ -1634,8 +1548,6 @@ static ssize_t tls_do_sendpage(struct tls_sock *tsk)
 	int ret;
 	size_t data_len;
 	struct msghdr msg = {};
-
-	xprintk("--> %s", __func__);
 
 	data_len = min_t(size_t,
 			tsk->sendpage_ctx.current_size,
@@ -1686,8 +1598,6 @@ static ssize_t tls_sendpage(struct socket *sock, struct page *page,
 	size_t copy, copied;
 	struct tls_sock *tsk;
 	struct scatterlist *sg;
-
-	xprintk("--> %s", __func__);
 
 	tsk = tls_sk(sock->sk);
 	lock_sock(sock->sk);
@@ -1741,15 +1651,12 @@ sendpage_end:
 	return ret < 0 ? ret : size;
 }
 
-/*TODO: When binding, blow away all skbs from underlying socket */
 static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 {
 	int ret;
 	struct tls_sock *tsk;
 	struct sockaddr_ktls *sa_ktls;
 	struct strp_callbacks cb;
-
-	xprintk("--> %s", __func__);
 
 	if (uaddr == NULL || sizeof(*sa_ktls) != addr_len)
 		return -EBADMSG;
@@ -1801,11 +1708,9 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		goto bind_end;
 	}
 
-	xprintk("--1");
 	if (!tsk->aead_recv) {
 		tsk->aead_recv = crypto_alloc_aead(tsk->cipher_crypto,
 				CRYPTO_ALG_INTERNAL, 0);
-		xprintk("--1");
 		if (IS_ERR(tsk->aead_recv)) {
 			ret = PTR_ERR(tsk->aead_recv);
 			tsk->aead_recv = NULL;
@@ -1861,8 +1766,6 @@ bind_end:
 int tls_release(struct socket *sock)
 {
 	struct tls_sock *tsk;
-
-	xprintk("--> %s", __func__);
 
 	tsk = tls_sk(sock->sk);
 
@@ -1926,12 +1829,7 @@ static void tls_sock_destruct(struct sock *sk)
 {
 	struct tls_sock *tsk;
 
-	xprintk("--> %s", __func__);
-
 	tsk = tls_sk(sk);
-
-	/* TODO: remove */
-	pr_debug("tls: parallel executions: %u\n", tsk->parallel_count_stat);
 
 	cancel_work_sync(&tsk->recv_work);
 
@@ -1950,7 +1848,6 @@ static void tls_sock_destruct(struct sock *sk)
 		tsk->socket = NULL;
 	}
 
-	/* kfree(NULL) is safe */
 	kfree(tsk->iv_send);
 
 	kfree(tsk->key_send.key);
@@ -1983,8 +1880,6 @@ static int tls_create(struct net *net,
 	int i;
 	struct sock *sk;
 	struct tls_sock *tsk;
-
-	xprintk("--> %s", __func__);
 
 	switch (sock->type) {
 	case SOCK_STREAM:
@@ -2097,8 +1992,6 @@ static int __init tls_init(void)
 {
 	int ret = -ENOMEM;
 
-	xprintk("--> %s", __func__);
-
 	tls_wq = create_workqueue("ktls");
 	if (!tls_wq)
 		goto tls_init_end;
@@ -2122,7 +2015,6 @@ tls_init_end:
 
 static void __exit tls_exit(void)
 {
-	xprintk("--> %s", __func__);
 	sock_unregister(PF_KTLS);
 	proto_unregister(&tls_proto);
 	destroy_workqueue(tls_wq);
@@ -2131,7 +2023,3 @@ static void __exit tls_exit(void)
 module_init(tls_init);
 module_exit(tls_exit);
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Fridolin Pokorny <fridolin.pokorny@gmail.com>");
-MODULE_DESCRIPTION("TLS/DTLS kernel interface");
-
-/* vim: set foldmethod=syntax ts=8 sts=8 sw=8 noexpandtab */
