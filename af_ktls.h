@@ -18,18 +18,10 @@
 
 #include <linux/types.h>
 
-/*
- * Just for testing some unused family.
- * TODO: this needs to be moved to include/linux/socket.h once linux will
- * support AF_KTLS socket. We have to pick some unused now since linux does not
- * allow to register unknown protocol family.
- */
 #define PF_KTLS				12
 #define AF_KTLS				PF_KTLS
 
-/*
- * getsockopt() optnames
- */
+/* getsockopt() optnames */
 #define KTLS_SET_IV_RECV		1
 #define KTLS_SET_KEY_RECV		2
 #define KTLS_SET_SALT_RECV		3
@@ -39,9 +31,7 @@
 #define KTLS_SET_MTU			7
 #define KTLS_UNATTACH			8
 
-/*
- * setsockopt() optnames
- */
+/* setsockopt() optnames */
 #define KTLS_GET_IV_RECV		11
 #define KTLS_GET_KEY_RECV		12
 #define KTLS_GET_SALT_RECV		13
@@ -50,24 +40,18 @@
 #define KTLS_GET_SALT_SEND		16
 #define KTLS_GET_MTU			17
 
-/*
- * Supported ciphers
- */
+/* Supported ciphers */
 #define KTLS_CIPHER_AES_GCM_128		51
 
 #define KTLS_VERSION_LATEST		0
 #define KTLS_VERSION_1_2		1
 
-/*
- * Useful constants
- */
+/* Constants */
 #define KTLS_AES_GCM_128_IV_SIZE	((size_t)8)
 #define KTLS_AES_GCM_128_KEY_SIZE	((size_t)16)
 #define KTLS_AES_GCM_128_SALT_SIZE	((size_t)4)
 
-/*
- * Maximum data size carried in a TLS/DTLS record
- */
+/* Maximum data size carried in a TLS/DTLS record */
 #define KTLS_MAX_PAYLOAD_SIZE		((size_t)1 << 14)
 
 struct sockaddr_ktls {
@@ -76,7 +60,4 @@ struct sockaddr_ktls {
 	__u16   sa_version;
 };
 
-#endif // AF_KTLS_H_
-
-/* vim: set foldmethod=syntax ts=8 sts=8 sw=8 noexpandtab */
-
+#endif
