@@ -2,7 +2,7 @@
  * DTLS sliding window handling
  */
 #define DTLS_EPOCH_SHIFT		(6 * CHAR_BIT)
-#define DTLS_SEQ_NUM_MASK		0x0000FFFFFFFFFFFF
+#define DTLS_SEQ_NUM_MASK		0x0000FFFFFFFFFFFFL
 
 #define DTLS_WINDOW_INIT(W)		((W).bits = (W.start) = 0)
 
@@ -37,11 +37,11 @@
  */
 static int dtls_window(struct tls_sock *tsk, const char *sn)
 {
-	u64 *seq_num_ptr, *seq_num_last_ptr;
+	__be64 *seq_num_ptr, *seq_num_last_ptr;
 	u64 seq_num, seq_num_last;
 
-	seq_num_ptr = (u64 *)sn;
-	seq_num_last_ptr = (u64 *)tsk->iv_recv;
+	seq_num_ptr = (__be64 *)sn;
+	seq_num_last_ptr = (__be64 *)tsk->iv_recv;
 
 	seq_num = be64_to_cpu(*seq_num_ptr);
 	seq_num_last = be64_to_cpu(*seq_num_last_ptr);
