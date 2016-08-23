@@ -89,7 +89,7 @@
 
 /* Ensure that bind(2) was called
  */
-#define KTLS_SETSOCKOPT_READY(T)	((T)->aead_send	&& (T)->aead_recv)
+#define KTLS_SETSOCKOPT_READY(T)	((T)->aead_send && (T)->aead_recv)
 #define KTLS_GETSOCKOPT_READY(T)	KTLS_SETSOCKOPT_READY(T)
 
 /* Ensure that we have needed key material
