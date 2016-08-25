@@ -1570,11 +1570,15 @@ static ssize_t tls_sendpage(struct socket *sock, struct page *page,
 			    int offset, size_t size, int flags)
 {
 	int ret = 0;
-	size_t pages;
-	unsigned int i;
-	size_t copy, copied;
 	struct tls_sock *tsk;
 	struct scatterlist *sg;
+	bool eor;
+
+	if (flags & MSG_SENDPAGE_NOTLAST)
+		flags |= MSG_MORE;
+
+	/* No MSG_EOR from splice, only look at MSG_MORE */
+	eor = !(flags & MSG_MORE);
 
 	tsk = tls_sk(sock->sk);
 	lock_sock(sock->sk);
@@ -1589,35 +1593,18 @@ static ssize_t tls_sendpage(struct socket *sock, struct page *page,
 		goto sendpage_end;
 	}
 
-	/* TODO: handle flags, see issue #4 */
-
 	sg = tsk->sendpage_ctx.sg;
 
-	pages = size / PAGE_SIZE;
-	if (pages * PAGE_SIZE < size)
-		pages++;
-
-	copied = 0;
-	for (i = 0; i < pages; i++) {
-		get_page(page + i);
-		copy = min_t(size_t, size - copied, PAGE_SIZE);
-		sg_unmark_end(sg + tsk->sendpage_ctx.used);
-		sg_set_page(sg + tsk->sendpage_ctx.used, page + i, copy,
-			    i == 0 ? offset : 0);
-		tsk->sendpage_ctx.used++;
-		sg_mark_end(sg + tsk->sendpage_ctx.used);
-		copied += copy;
-	}
+	get_page(page);
+	sg_unmark_end(sg + tsk->sendpage_ctx.used);
+	sg_set_page(sg + tsk->sendpage_ctx.used, page, size, offset);
+	tsk->sendpage_ctx.used++;
+	sg_mark_end(sg + tsk->sendpage_ctx.used);
 
 	tsk->sendpage_ctx.current_size += size;
 
-	while (tsk->sendpage_ctx.current_size >= tsk->mtu_payload ||
-	       (!(flags & MSG_SENDPAGE_NOTLAST) &&
-	       tsk->sendpage_ctx.current_size)) {
+	if (tsk->sendpage_ctx.current_size >= tsk->mtu_payload || eor)
 		ret = tls_do_sendpage(tsk);
-		if (ret < 0)
-			goto sendpage_end;
-	}
 
 sendpage_end:
 	if (ret < 0)
