@@ -189,11 +189,6 @@ struct tls_sock {
 	/* TLS/DTLS version for header */
 	char version[2];
 
-	/* store mtu for raw payload -- without header, tag, (and seq num
-	 * when DTLS)
-	 */
-	size_t mtu_payload;
-
 	/* DTLS window handling */
 	struct {
 		u64 bits;
@@ -206,7 +201,6 @@ struct tls_sock {
 		struct scatterlist sg[KTLS_SG_DATA_SIZE];
 		size_t used;
 		size_t current_size;
-		size_t desired_size;
 		struct page *page;
 	} sendpage_ctx;
 };
@@ -275,11 +269,10 @@ static void tls_free_sendpage_ctx(struct tls_sock *tsk)
 
 	tsk->sendpage_ctx.used = 0;
 	tsk->sendpage_ctx.current_size = 0;
-	tsk->sendpage_ctx.desired_size = 0;
 }
 
-/* called once data are sent by sendpage() == MTU is reached or last
- * record is sent based on packetization)
+/* called once data are sent by sendpage() or last record is sent
+ * based on packetization)
  */
 static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
 {
@@ -789,34 +782,6 @@ set_salt_end:
 	return ret < 0 ? ret : src_len;
 }
 
-static int tls_set_mtu(struct socket *sock, char __user *src, size_t src_len)
-{
-	int ret;
-	size_t mtu;
-	struct tls_sock *tsk;
-
-	tsk = tls_sk(sock->sk);
-
-	if (src_len != sizeof(tsk->mtu_payload))
-		ret = -EBADMSG;
-
-	ret = copy_from_user(&mtu, src, sizeof(tsk->mtu_payload));
-	if (ret)
-		return ret;
-
-	if (mtu <= (IS_TLS(tsk) ? KTLS_TLS_OVERHEAD : KTLS_DTLS_OVERHEAD))
-		return -EBADMSG;
-
-	mtu -= (IS_TLS(tsk) ? KTLS_TLS_OVERHEAD : KTLS_DTLS_OVERHEAD);
-
-	if (mtu > KTLS_MAX_PAYLOAD_SIZE)
-		return -EBADMSG;
-
-	tsk->mtu_payload = mtu;
-
-	return mtu;
-}
-
 static void tls_do_unattach(struct socket *sock)
 {
 	struct tls_sock *tsk;
@@ -864,9 +829,6 @@ static int tls_setsockopt(struct socket *sock,
 		break;
 	case KTLS_SET_SALT_SEND:
 		ret = tls_set_salt(sock, 0, optval, optlen);
-		break;
-	case KTLS_SET_MTU:
-		ret = tls_set_mtu(sock, optval, optlen);
 		break;
 	case KTLS_UNATTACH:
 		tls_do_unattach(sock);
@@ -954,7 +916,6 @@ static int tls_getsockopt(struct socket *sock,
 {
 	int ret;
 	int len;
-	size_t mtu;
 	const struct tls_sock *tsk;
 
 	tsk = tls_sk(sock->sk);
@@ -993,23 +954,6 @@ static int tls_getsockopt(struct socket *sock,
 	case KTLS_GET_SALT_SEND:
 		ret = tls_get_salt(tsk, 0, optval, len);
 		break;
-	case KTLS_GET_MTU:
-		if (len < sizeof(tsk->mtu_payload)) {
-			ret = -ENOMEM;
-			goto end;
-		}
-		if (put_user(sizeof(tsk->mtu_payload), optlen)) {
-			ret = -EFAULT;
-			goto end;
-		}
-		mtu = KTLS_RECORD_SIZE(tsk, tsk->mtu_payload);
-		if (copy_to_user(optval, &mtu, sizeof(mtu))) {
-			ret = -EFAULT;
-			goto end;
-		}
-
-		ret = 0;
-		goto end;
 	default:
 		ret = -EBADMSG;
 		break;
@@ -1528,7 +1472,7 @@ static ssize_t tls_do_sendpage(struct tls_sock *tsk)
 
 	data_len = min_t(size_t,
 			 tsk->sendpage_ctx.current_size,
-			 tsk->mtu_payload);
+			 KTLS_MAX_PAYLOAD_SIZE);
 
 	tls_make_prepend(tsk, tsk->header_send, data_len);
 	tls_make_aad(tsk, 0, tsk->aad_send, data_len, tsk->iv_send);
@@ -1611,7 +1555,7 @@ static ssize_t tls_sendpage(struct socket *sock, struct page *page,
 
 	tsk->sendpage_ctx.current_size += size;
 
-	while (tsk->sendpage_ctx.current_size >= tsk->mtu_payload ||
+	while (tsk->sendpage_ctx.current_size >= KTLS_MAX_PAYLOAD_SIZE ||
 	       (!(flags & MSG_SENDPAGE_NOTLAST) &&
 	       tsk->sendpage_ctx.current_size)) {
 		ret = tls_do_sendpage(tsk);
@@ -1834,8 +1778,6 @@ static void tls_sock_destruct(struct sock *sk)
 
 	crypto_free_aead(tsk->aead_recv);
 
-	if (tsk->pages_send)
-		__free_pages(tsk->pages_send, order_base_2(KTLS_DATA_PAGES));
 	skb_queue_purge(&sk->sk_receive_queue);
 }
 
@@ -1891,10 +1833,6 @@ static int tls_create(struct net *net,
 
 	tsk->cipher_crypto = NULL;
 	memset(tsk->version, 0, sizeof(tsk->version));
-
-	/* Use maximum MTU by default
-	 */
-	tsk->mtu_payload = KTLS_MAX_PAYLOAD_SIZE;
 
 	sg_init_table(tsk->sendpage_ctx.sg, KTLS_SG_DATA_SIZE);
 	sg_mark_end(&tsk->sendpage_ctx.sg[0]);
