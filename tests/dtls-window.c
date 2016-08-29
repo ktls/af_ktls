@@ -380,6 +380,39 @@ static void check_dtls_window_epoch_lower(void **glob_state)
 	assert_int_equal(dtls_window(&state, (char*)&t), -1);
 }
 
+static void check_dtls_window_skip1(void **glob_state)
+{
+	struct tls_sock state;
+	uint64_t t;
+	unsigned i;
+
+	RESET_WINDOW;
+	t = 0;
+	SET_WINDOW_START(t);
+	SET_WINDOW_LAST_RECV(t+1);
+
+	for (i=2;i<256;i+=2) {
+		t = cpu_to_be64(i);
+		assert_int_equal(dtls_window(&state, (char*)&t), 0);
+	}
+}
+
+static void check_dtls_window_skip3(void **glob_state)
+{
+	struct tls_sock state;
+	uint64_t t;
+	unsigned i;
+
+	RESET_WINDOW;
+	t = 0;
+	SET_WINDOW_START(t);
+	SET_WINDOW_LAST_RECV(t+1);
+
+	for (i=5;i<256;i++) {
+		t = cpu_to_be64(i);
+		assert_int_equal(dtls_window(&state, (char*)&t), 0);
+	}
+}
 
 int main(void)
 {
@@ -403,7 +436,9 @@ int main(void)
 		cmocka_unit_test(check_dtls_window_very_large_12),
 		cmocka_unit_test(check_dtls_window_very_large_19),
 		cmocka_unit_test(check_dtls_window_very_large_91),
-		cmocka_unit_test(check_dtls_window_very_large_outside)
+		cmocka_unit_test(check_dtls_window_very_large_outside),
+		cmocka_unit_test(check_dtls_window_skip1),
+		cmocka_unit_test(check_dtls_window_skip3)
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
 }
