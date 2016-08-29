@@ -27,10 +27,16 @@
 #define DTLS_WINDOW_MARK(W, S) ((W).bits |= ((u64)1 << \
 					     DTLS_WINDOW_OFFSET(W, S)))
 
-#define DTLS_WINDOW_UPDATE(W)		while ((W).bits & (u64)1) {	\
+#define DTLS_WINDOW_UPDATE(W)		\
+					if (((W).bits & 0xffffffffffff0000LL) != 0) { \
+						(W).bits = (W).bits >> 1; \
+						(W).start++; \
+					} \
+					while ((W).bits & (u64)1) {	\
 						(W).bits = (W).bits >> 1; \
 						(W).start++; \
 					}
+
 /* Handle DTLS sliding window
  * rv: rv < 0  drop packet
  *     rv == 0 OK
