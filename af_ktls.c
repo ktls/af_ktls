@@ -168,18 +168,14 @@ struct tls_sock {
 
 	/* Sending context */
 	struct scatterlist sg_tx_data[KTLS_SG_DATA_SIZE];
-	char header_send[MAX(KTLS_TLS_PREPEND_SIZE, KTLS_DTLS_PREPEND_SIZE)];
+	struct scatterlist sg_tx_data2[ALG_MAX_PAGES + 1];
 	char aad_send[KTLS_AAD_SPACE_SIZE];
 	char tag_send[KTLS_TAG_SIZE];
 	struct page *pages_send;
-	struct af_alg_sgl sgl_send[UIO_MAXIOV];
 	struct scatterlist sgaad_send[2];
 	struct scatterlist sgtag_send[2];
 
 	/* Receive */
-	struct sk_buff *rx_skb_head;
-	struct sk_buff **rx_skb_nextp;
-	unsigned int rx_need_bytes;
 	struct scatterlist sgin[ALG_MAX_PAGES + 1];
 	char aad_recv[KTLS_AAD_SPACE_SIZE];
 	char header_recv[MAX(KTLS_TLS_PREPEND_SIZE, KTLS_DTLS_PREPEND_SIZE)];
@@ -204,13 +200,7 @@ struct tls_sock {
 		u64 start;
 	} dtls_window;
 
-	/* Context used for sendpage(2) packetization */
-	struct {
-		struct scatterlist sg[KTLS_SG_DATA_SIZE];
-		size_t used;
-		size_t current_size;
-		struct page *page;
-	} sendpage_ctx;
+	int unsent;
 };
 
 struct tls_rx_msg {
@@ -228,6 +218,13 @@ static inline struct tls_rx_msg *tls_rx_msg(struct sk_buff *skb)
 static inline struct tls_sock *tls_sk(struct sock *sk)
 {
 	return (struct tls_sock *)sk;
+}
+
+static inline bool tls_stream_memory_free(const struct sock *sk)
+{
+	const struct tls_sock *tsk = (const struct tls_sock *)sk;
+
+	return tsk->unsent < KTLS_MAX_PAYLOAD_SIZE;
 }
 
 static int tls_do_decryption(struct tls_sock *tsk,
@@ -259,69 +256,6 @@ static void increment_seqno(unsigned char *seq, struct tls_sock *tsk)
 	 */
 	if (unlikely((IS_TLS(tsk) && i == -1) || (IS_DTLS(tsk) && i <= 1)))
 		tls_err_abort(tsk);
-}
-
-static void tls_free_sendpage_ctx(struct tls_sock *tsk)
-{
-	size_t i;
-	struct scatterlist *sg;
-
-	sg = tsk->sendpage_ctx.sg;
-
-	for (i = 0; i < tsk->sendpage_ctx.used; i++) {
-		put_page(sg_page(sg + i));
-		sg_unmark_end(sg + i);
-		sg_set_page(sg + i, NULL, 0, 0);
-	}
-	sg_mark_end(sg);
-
-	tsk->sendpage_ctx.used = 0;
-	tsk->sendpage_ctx.current_size = 0;
-}
-
-/* called once data are sent by sendpage() or last record is sent
- * based on packetization)
- */
-static void tls_update_senpage_ctx(struct tls_sock *tsk, size_t size)
-{
-	size_t walked_size;
-	size_t put_count;
-	struct scatterlist *sg;
-	struct scatterlist *sg_start;
-
-	sg = tsk->sendpage_ctx.sg;
-
-	if (size == tsk->sendpage_ctx.current_size) {
-		tls_free_sendpage_ctx(tsk);
-		return;
-	}
-
-	walked_size = 0;
-	sg_start = sg;
-	put_count = 0;
-	while (put_count < tsk->sendpage_ctx.used &&
-	       walked_size + sg_start->length <= size) {
-		walked_size += sg_start->length;
-		put_page(sg_page(sg_start));
-		sg_start++;
-		put_count++;
-	}
-
-	/* adjust length and offset so we can send with right offset
-	 * next time
-	 */
-	sg_start->offset += (size - walked_size);
-	sg_start->length -= (size - walked_size);
-	tsk->sendpage_ctx.current_size -= size;
-	tsk->sendpage_ctx.used -= put_count;
-
-	/* we will shift freed pages so chaining from AAD is correct
-	 * and we can use whole scatterlist next time
-	 */
-	memmove(sg, sg_start,
-		(KTLS_SG_DATA_SIZE - 1 - put_count) * sizeof(
-				tsk->sendpage_ctx.sg[0]));
-	sg_mark_end(&sg[tsk->sendpage_ctx.used]);
 }
 
 /* Must be called with socket callback locked */
@@ -1097,82 +1031,194 @@ bail:
 	return ret;
 }
 
+static void tls_push(struct tls_sock *tsk)
+{
+	int bytes = min_t(int, tsk->unsent, (int)KTLS_MAX_PAYLOAD_SIZE);
+	int nsg, ret = 0;
+	int order_npages = 0;
+	struct sk_buff *head = skb_peek(&tsk->sk.sk_write_queue);
+
+	if (!head)
+		return;
+
+	sg_init_table(tsk->sg_tx_data2, ARRAY_SIZE(tsk->sg_tx_data2));
+	nsg = skb_to_sgvec(head, &tsk->sg_tx_data2[0], 0, bytes);
+
+	tls_make_aad(tsk, 0, tsk->aad_send, bytes, tsk->iv_send);
+
+	/* chain sgaad_send with sg, we need to restore this
+	 * once finished because of usage in tls_sendmsg()
+	 */
+	sg_chain(tsk->sgaad_send, 2, tsk->sg_tx_data2);
+	sg_chain(tsk->sg_tx_data2,
+		 nsg + 1,
+		 tsk->sgtag_send);
+
+	ret = tls_pre_encrypt(tsk, bytes);
+	if (ret < 0)
+		goto do_sendmsg_end;
+
+	order_npages = ret;
+
+	ret = tls_do_encryption(tsk,
+				tsk->sgaad_send,
+				tsk->sg_tx_data,
+				bytes);
+
+	if (ret < 0)
+		goto do_sendmsg_end;
+
+	tls_make_prepend(tsk, page_address(tsk->pages_send), bytes);
+
+	ret = kernel_sendpage(
+		tsk->socket, tsk->pages_send, /* offset */ 0,
+		bytes + KTLS_OVERHEAD(tsk), 0);
+
+	// TODO check ret
+	if (ret > 0) {
+		/* Successfully sent the whole packet, account for it. */
+		skb_dequeue(&tsk->sk.sk_write_queue);
+		kfree_skb(head);
+		tsk->sk.sk_wmem_queued -= bytes;
+		tsk->unsent -= bytes;
+		increment_seqno(tsk->iv_send, tsk);
+	}
+do_sendmsg_end:
+
+	__free_pages(tsk->pages_send, order_npages);
+	tsk->pages_send = NULL;
+}
+
 static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 {
-	struct tls_sock *tsk;
-	unsigned int i;
-	unsigned int cnt = 0;
+	struct sock *sk = sock->sk;
+	struct tls_sock *tsk = tls_sk(sk);
 	int ret = 0;
-	int order_npages = 0;
+	long timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+	bool eor = !(msg->msg_flags & MSG_MORE) || IS_DTLS(tsk);
+	struct sk_buff *skb = NULL;
+	size_t copy, copied = 0;
 
-	tsk = tls_sk(sock->sk);
 	lock_sock(sock->sk);
+
+	if (msg->msg_flags & MSG_OOB) {
+		ret = -ENOTSUPP;
+		goto send_end;
+	}
+	sk_clear_bit(SOCKWQ_ASYNC_NOSPACE, sk);
+
+	if (sk->sk_err)
+		goto send_end;
 
 	if (!KTLS_SEND_READY(tsk)) {
 		ret = -EBADMSG;
 		goto send_end;
 	}
 
-	if (size > KTLS_MAX_PAYLOAD_SIZE) {
+	if (size > KTLS_MAX_PAYLOAD_SIZE && IS_DTLS(tsk)) {
 		ret = -E2BIG;
 		goto send_end;
 	}
 
-	/* TODO: handle flags, see issue #4 */
+	while (msg_data_left(msg)) {
+		bool merge = true;
+		int i;
+		struct page_frag *pfrag;
 
-	tls_make_aad(tsk, 0, tsk->aad_send, size, tsk->iv_send);
+		skb = tcp_write_queue_tail(sk);
 
-	while (iov_iter_count(&msg->msg_iter)) {
-		size_t seglen = iov_iter_count(&msg->msg_iter);
-		int len = af_alg_make_sg(&tsk->sgl_send[cnt],
-				&msg->msg_iter, seglen);
-		if (len < 0)
+		while (!skb) {
+			ret = sk_stream_wait_memory(sk, &timeo);
+			if (ret)
+				goto send_end;
+
+			skb = alloc_skb(0, sk->sk_allocation);
+			if (skb)
+				__skb_queue_tail(&sk->sk_write_queue, skb);
+		}
+
+		i = skb_shinfo(skb)->nr_frags;
+		pfrag = sk_page_frag(sk);
+
+		if (!sk_page_frag_refill(sk, pfrag))
+			goto wait_for_memory;
+
+		if (!skb_can_coalesce(skb, i, pfrag->page,
+				      pfrag->offset)) {
+			if (i == ALG_MAX_PAGES) {
+				struct sk_buff *tskb;
+
+				tskb = alloc_skb(0, sk->sk_allocation);
+				if (!tskb)
+					goto wait_for_memory;
+
+				if (skb)
+					skb->next = tskb;
+				else
+					__skb_queue_tail(&sk->sk_write_queue,
+							 tskb);
+
+				skb = tskb;
+				skb->ip_summed = CHECKSUM_UNNECESSARY;
+				continue;
+			}
+			merge = false;
+		}
+
+		copy = min_t(int, msg_data_left(msg),
+			     pfrag->size - pfrag->offset);
+		copy = min_t(int, copy, KTLS_MAX_PAYLOAD_SIZE - tsk->unsent);
+
+		if (!sk_wmem_schedule(sk, copy))
+			goto wait_for_memory;
+
+		ret = skb_copy_to_page_nocache(sk, &msg->msg_iter, skb,
+					       pfrag->page,
+					       pfrag->offset,
+					       copy);
+		if (ret)
 			goto send_end;
-		ret += len;
-		if (cnt)
-			af_alg_link_sg(&tsk->sgl_send[cnt - 1],
-				       &tsk->sgl_send[cnt]);
-		iov_iter_advance(&msg->msg_iter, len);
-		cnt++;
-	}
-	sg_unmark_end(&tsk->sgaad_send[1]);
-	sg_chain(tsk->sgaad_send, 2, tsk->sgl_send[0].sg);
 
-	sg_unmark_end(tsk->sgl_send[cnt - 1].sg +
-			tsk->sgl_send[cnt - 1].npages - 1);
-	sg_chain(tsk->sgl_send[cnt - 1].sg, tsk->sgl_send[cnt - 1].npages + 1,
-		 tsk->sgtag_send);
+		/* Update the skb. */
+		if (merge) {
+			skb_frag_size_add(&skb_shinfo(skb)->frags[i - 1], copy);
+		} else {
+			skb_fill_page_desc(skb, i, pfrag->page,
+					   pfrag->offset, copy);
+			get_page(pfrag->page);
+		}
 
-	ret = tls_pre_encrypt(tsk, size);
-	if (ret < 0)
-		goto send_end;
+		pfrag->offset += copy;
+		copied += copy;
+		skb->len += copy;
+		skb->data_len += copy;
+		tsk->unsent += copy;
 
-	order_npages = ret;
-	ret = tls_do_encryption(tsk, tsk->sgaad_send, tsk->sg_tx_data, size);
-	if (ret < 0)
-		goto encrypt_failed;
+		if (tsk->unsent >= KTLS_MAX_PAYLOAD_SIZE)
+			tls_push(tsk);
 
-	tls_make_prepend(tsk, page_address(tsk->pages_send), size);
+		continue;
 
-	ret = kernel_sendpage(tsk->socket,
-			      tsk->pages_send,
-			      /*offset*/ 0,
-			      size + KTLS_OVERHEAD(tsk),
-			      msg->msg_flags);
-
-	if (ret > 0) {
-		increment_seqno(tsk->iv_send, tsk);
-		ret = size;
+wait_for_memory:
+		tls_push(tsk);
+		ret = sk_stream_wait_memory(sk, &timeo);
+		if (ret)
+			goto send_end;
 	}
 
-encrypt_failed:
-	__free_pages(tsk->pages_send, order_npages);
-	tsk->pages_send = NULL;
+	if (eor)
+		tls_push(tsk);
+
 send_end:
-	for (i = 0; i < cnt; i++)
-		af_alg_free_sg(&tsk->sgl_send[i]);
-	release_sock(sock->sk);
-	return ret;
+	ret = sk_stream_error(sk, msg->msg_flags, ret);
+
+	/* make sure we wake any epoll edge trigger waiter */
+	if (unlikely(skb_queue_len(&sk->sk_write_queue) == 0 && ret == -EAGAIN))
+		sk->sk_write_space(sk);
+
+	release_sock(sk);
+
+	return ret < 0 ? ret : size;
 }
 
 static int tls_do_decryption(struct tls_sock *tsk,
@@ -1527,79 +1573,25 @@ splice_read_end:
 	return ret;
 }
 
-static ssize_t tls_do_sendpage(struct tls_sock *tsk)
-{
-	int ret;
-	size_t data_len;
-	int order_npages = 0;
-
-	data_len = min_t(size_t,
-			 tsk->sendpage_ctx.current_size,
-			 KTLS_MAX_PAYLOAD_SIZE);
-
-	tls_make_aad(tsk, 0, tsk->aad_send, data_len, tsk->iv_send);
-
-	/* chain sgaad_send with sg, we need to restore this
-	 * once finished because of usage in tls_sendmsg()
-	 */
-	sg_chain(tsk->sgaad_send, 2, tsk->sendpage_ctx.sg);
-	sg_chain(tsk->sendpage_ctx.sg,
-		 tsk->sendpage_ctx.used + 1,
-		 tsk->sgtag_send);
-
-	ret = tls_pre_encrypt(tsk, data_len);
-	if (ret < 0)
-		goto do_sendmsg_end;
-
-	order_npages = ret;
-
-	ret = tls_do_encryption(tsk,
-				tsk->sgaad_send,
-				tsk->sg_tx_data,
-				data_len);
-
-	if (ret < 0)
-		goto do_sendmsg_end;
-
-	tls_make_prepend(tsk, page_address(tsk->pages_send), data_len);
-
-	ret = kernel_sendpage(
-		tsk->socket, tsk->pages_send, /* offset */ 0,
-		data_len + KTLS_OVERHEAD(tsk), 0);
-
-	if (ret > 0) {
-		ret = data_len;
-		increment_seqno(tsk->iv_send, tsk);
-		tls_update_senpage_ctx(tsk, data_len);
-	} else {
-		tls_free_sendpage_ctx(tsk);
-	}
-
-do_sendmsg_end:
-
-	__free_pages(tsk->pages_send, order_npages);
-	tsk->pages_send = NULL;
-
-	/* restore, so we can use sendmsg() */
-	sg_chain(tsk->sgaad_send, 2, tsk->sgl_send[0].sg);
-	/* remove chaining to sg tag */
-	sg_mark_end(&tsk->sendpage_ctx.sg[tsk->sendpage_ctx.used]);
-
-	return ret;
-}
-
 static ssize_t tls_sendpage(struct socket *sock, struct page *page,
 			    int offset, size_t size, int flags)
 {
-	int ret = 0;
-	size_t pages;
-	unsigned int i;
-	size_t copy, copied;
+	int ret = 0, i;
+	struct sock *sk = sock->sk;
+	long timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
 	struct tls_sock *tsk;
-	struct scatterlist *sg;
+	bool eor;
+	struct sk_buff *skb = NULL;
+	size_t queued = 0;
 
-	tsk = tls_sk(sock->sk);
-	lock_sock(sock->sk);
+	if (flags & MSG_SENDPAGE_NOTLAST)
+		flags |= MSG_MORE;
+
+	/* No MSG_EOR from splice, only look at MSG_MORE */
+	eor = !(flags & MSG_MORE);
+
+	tsk = tls_sk(sk);
+	lock_sock(sk);
 
 	if (!KTLS_SEND_READY(tsk)) {
 		ret = -EBADMSG;
@@ -1610,42 +1602,90 @@ static ssize_t tls_sendpage(struct socket *sock, struct page *page,
 		ret = -ENOTSUPP;
 		goto sendpage_end;
 	}
+	sk_clear_bit(SOCKWQ_ASYNC_NOSPACE, sk);
 
-	/* TODO: handle flags, see issue #4 */
+	if (sk->sk_err)
+		goto sendpage_end;
 
-	sg = tsk->sendpage_ctx.sg;
+	/* Call the sk_stream functions to manage the sndbuf mem. */
+	while (queued < size) {
+		size_t send_size = min(size, KTLS_MAX_PAYLOAD_SIZE);
 
-	pages = size / PAGE_SIZE;
-	if (pages * PAGE_SIZE < size)
-		pages++;
+		if (!sk_stream_memory_free(sk) ||
+		    (tsk->unsent + send_size > KTLS_MAX_PAYLOAD_SIZE)) {
+			tls_push(tsk);
+			set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
+			ret = sk_stream_wait_memory(sk, &timeo);
+			if (ret)
+				goto sendpage_end;
+		}
 
-	copied = 0;
-	for (i = 0; i < pages; i++) {
-		get_page(page + i);
-		copy = min_t(size_t, size - copied, PAGE_SIZE);
-		sg_unmark_end(sg + tsk->sendpage_ctx.used);
-		sg_set_page(sg + tsk->sendpage_ctx.used, page + i, copy,
-			    i == 0 ? offset : 0);
-		tsk->sendpage_ctx.used++;
-		sg_mark_end(sg + tsk->sendpage_ctx.used);
-		copied += copy;
+		skb = tcp_write_queue_tail(sk);
+		if (skb) {
+			i = skb_shinfo(skb)->nr_frags;
+
+			if (skb_can_coalesce(skb, i, page, offset)) {
+				skb_frag_size_add(
+					&skb_shinfo(skb)->frags[i - 1],
+					send_size);
+				skb_shinfo(skb)->tx_flags |= SKBTX_SHARED_FRAG;
+				goto coalesced;
+			}
+
+			if (i >= ALG_MAX_PAGES) {
+				struct sk_buff *tskb;
+
+				tskb = alloc_skb(0, sk->sk_allocation);
+				while (!tskb) {
+					tls_push(tsk);
+					set_bit(SOCK_NOSPACE,
+						&sk->sk_socket->flags);
+					ret = sk_stream_wait_memory(sk, &timeo);
+					if (ret)
+						goto sendpage_end;
+				}
+
+				if (skb)
+					skb->next = tskb;
+				else
+					__skb_queue_tail(&sk->sk_write_queue,
+							 tskb);
+				skb = tskb;
+				i = 0;
+			}
+		} else {
+			skb = alloc_skb(0, sk->sk_allocation);
+			__skb_queue_tail(&sk->sk_write_queue, skb);
+			i = 0;
+		}
+
+		get_page(page);
+		skb_fill_page_desc(skb, i, page, offset, send_size);
+		skb_shinfo(skb)->tx_flags |= SKBTX_SHARED_FRAG;
+
+coalesced:
+		skb->len += send_size;
+		skb->data_len += send_size;
+		skb->truesize += send_size;
+		sk->sk_wmem_queued += send_size;
+		sk_mem_charge(sk, send_size);
+		tsk->unsent += send_size;
+
+		if (eor || tsk->unsent >= KTLS_MAX_PAYLOAD_SIZE)
+			tls_push(tsk);
+		queued += send_size;
 	}
-
-	tsk->sendpage_ctx.current_size += size;
-
-	while (tsk->sendpage_ctx.current_size >= KTLS_MAX_PAYLOAD_SIZE ||
-	       (!(flags & MSG_SENDPAGE_NOTLAST) &&
-	       tsk->sendpage_ctx.current_size)) {
-		ret = tls_do_sendpage(tsk);
-		if (ret < 0)
-			goto sendpage_end;
-	}
-
 sendpage_end:
-	if (ret < 0)
-		tls_free_sendpage_ctx(tsk);
+	ret = sk_stream_error(sk, flags, ret);
 
-	release_sock(sock->sk);
+	if (ret < 0)
+		ret = sk_stream_error(sk, flags, ret);
+
+	/* make sure we wake any epoll edge trigger waiter */
+	if (unlikely(skb_queue_len(&sk->sk_write_queue) == 0 && ret == -EAGAIN))
+		sk->sk_write_space(sk);
+
+	release_sock(sk);
 
 	return ret < 0 ? ret : size;
 }
@@ -1765,8 +1805,6 @@ static int tls_release(struct socket *sock)
 
 	tsk = tls_sk(sock->sk);
 
-	tls_free_sendpage_ctx(tsk);
-
 	if (sock->sk)
 		sock_put(sock->sk);
 
@@ -1863,6 +1901,7 @@ static struct proto tls_proto = {
 	.name				= "KTLS",
 	.owner			= THIS_MODULE,
 	.obj_size		= sizeof(struct tls_sock),
+	.stream_memory_free = tls_stream_memory_free,
 };
 
 static int tls_create(struct net *net,
@@ -1871,7 +1910,6 @@ static int tls_create(struct net *net,
 		      int kern)
 {
 	int ret;
-	int i;
 	struct sock *sk;
 	struct tls_sock *tsk;
 
@@ -1912,10 +1950,8 @@ static int tls_create(struct net *net,
 	tsk->cipher_crypto = NULL;
 	memset(tsk->version, 0, sizeof(tsk->version));
 
-	sg_init_table(tsk->sendpage_ctx.sg, KTLS_SG_DATA_SIZE);
-	sg_mark_end(&tsk->sendpage_ctx.sg[0]);
-
 	tsk->pages_send = NULL;
+	tsk->unsent = 0;
 
 	ret = -ENOMEM;
 	/* Preallocation for sending
@@ -1929,8 +1965,6 @@ static int tls_create(struct net *net,
 		   tsk->tag_send, sizeof(tsk->tag_send));
 	sg_mark_end(tsk->sg_tx_data + KTLS_SG_DATA_SIZE - 1);
 
-	for (i = 0; i < UIO_MAXIOV; i++)
-		memset(&tsk->sgl_send[i], 0, sizeof(tsk->sgl_send[i]));
 	sg_init_table(tsk->sgaad_send, 2);
 	sg_init_table(tsk->sgtag_send, 2);
 
@@ -1939,7 +1973,6 @@ static int tls_create(struct net *net,
 	sg_set_buf(&tsk->sgtag_send[0], tsk->tag_send, sizeof(tsk->tag_send));
 
 	sg_unmark_end(&tsk->sgaad_send[1]);
-	sg_chain(tsk->sgaad_send, 2, tsk->sgl_send[0].sg);
 	INIT_WORK(&tsk->recv_work, tls_rx_work);
 
 	skb_queue_head_init(&tsk->rx_hold_queue);
