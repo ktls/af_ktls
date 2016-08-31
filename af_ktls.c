@@ -1034,18 +1034,15 @@ static int tls_do_encryption(struct tls_sock *tsk,
 		crypto_aead_reqsize(tsk->aead_recv);
 	struct aead_request *aead_req = (void *)sock_kmalloc(&tsk->sk, req_size,
 							GFP_KERNEL);
-	struct af_alg_completion completion;
-
 	if (!aead_req)
 		return -ENOMEM;
 
 	aead_request_set_tfm(aead_req, tsk->aead_send);
 	aead_request_set_ad(aead_req, KTLS_PADDED_AAD_SIZE);
 	aead_request_set_crypt(aead_req, sgin, sgout, data_len, tsk->iv_send);
+	aead_request_set_callback(aead_req, 0, NULL, NULL);
 
-	ret = af_alg_wait_for_completion(
-		crypto_aead_encrypt(aead_req),
-			&completion);
+	ret = crypto_aead_encrypt(aead_req);
 
 	if (aead_req)
 		sock_kfree_s(&tsk->sk, aead_req, req_size);
@@ -1186,8 +1183,6 @@ static int tls_do_decryption(struct tls_sock *tsk,
 		crypto_aead_reqsize(tsk->aead_recv);
 	struct aead_request *aead_req = (void *)sock_kmalloc(&tsk->sk, req_size,
 							GFP_KERNEL);
-	struct af_alg_completion completion;
-
 	if (!aead_req)
 		return -ENOMEM;
 
@@ -1196,10 +1191,9 @@ static int tls_do_decryption(struct tls_sock *tsk,
 	aead_request_set_crypt(aead_req, sgin, sgout,
 			       data_len + KTLS_TAG_SIZE,
 			       (u8 *)header_recv + KTLS_NONCE_OFFSET(tsk));
+	aead_request_set_callback(aead_req, 0, NULL, NULL);
 
-	ret = af_alg_wait_for_completion(
-			crypto_aead_decrypt(aead_req),
-			&completion);
+	ret = crypto_aead_decrypt(aead_req);
 
 	if (aead_req)
 		sock_kfree_s(&tsk->sk, aead_req, req_size);
