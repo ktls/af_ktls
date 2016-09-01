@@ -1747,13 +1747,21 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	tsk = tls_sk(sock->sk);
 	sa_ktls = (struct sockaddr_ktls *)uaddr;
 
+	lock_sock(sock->sk);
+
+	if (tsk->socket) {
+		ret = -EINVAL;
+		goto out;
+	}
+
 	switch (sa_ktls->sa_cipher) {
 	case KTLS_CIPHER_AES_GCM_128:
 		tsk->cipher_type = KTLS_CIPHER_AES_GCM_128;
 		tsk->cipher_crypto = "rfc5288(gcm(aes))";
 		break;
 	default:
-		return -ENOENT;
+		ret = -ENOENT;
+		goto out;
 	}
 
 	switch (sa_ktls->sa_version) {
@@ -1769,10 +1777,10 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		}
 		break;
 	default:
-		return -ENOENT;
+		ret = -ENOENT;
+		goto out;
 	}
 
-	lock_sock(sock->sk);
 	tsk->socket = sockfd_lookup(sa_ktls->sa_socket, &ret);
 	if (!tsk->socket) {
 		ret = -ENOENT;
@@ -1841,6 +1849,7 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 bind_end:
 	sockfd_put(tsk->socket);
 	tsk->socket = NULL;
+out:
 	release_sock(sock->sk);
 	return ret;
 }
