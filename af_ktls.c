@@ -190,6 +190,7 @@ struct tls_sock {
 	struct work_struct recv_work;
 	void (*saved_sk_data_ready)(struct sock *sk);
 	void (*saved_sk_write_space)(struct sock *sk);
+	size_t recv_len;
 
 	/* our cipher type and its crypto API representation (e.g. "gcm(aes)")
 	 */
@@ -469,6 +470,8 @@ static void tls_queue(struct strparser *strp, struct sk_buff *skb)
 	tls_rx_msg(skb)->decrypted = 0;
 	bh_lock_sock(&tsk->sk);
 
+	tsk->recv_len += rxm->full_len - KTLS_OVERHEAD(tsk);
+
 	ret = sock_queue_rcv_skb((struct sock *)tsk, skb);
 	if (ret < 0) {
 		/* skb receive queue is full. Apply backpressure on
@@ -493,7 +496,7 @@ static void tls_data_ready(struct sock *sk)
 		goto out;
 
 	if (IS_TLS(tsk))
-		strp_tcp_data_ready(&tsk->strp);
+		strp_data_ready(&tsk->strp);
 	else
 		queue_work(tls_rx_wq, &tsk->recv_work);
 
@@ -1437,6 +1440,60 @@ static struct sk_buff *tls_wait_data(struct tls_sock *tsk, int flags,
 	return skb;
 }
 
+
+static int tls_read_sock(struct sock *sk, read_descriptor_t *desc,
+			sk_read_actor_t recv_actor) {
+	struct strp_rx_msg *rxm;
+	struct sk_buff *skb;
+	struct tls_sock *tsk;
+	int err;
+	int used;
+	int copied = 0;
+
+	tsk = tls_sk(sk);
+
+	tls_dequeue_held_data(tsk);
+
+	while((skb = skb_peek(&sk->sk_receive_queue)) != NULL) {
+		rxm = strp_rx_msg(skb);
+
+		if (!tls_rx_msg(skb)->decrypted) {
+			err = decrypt_skb(tsk, skb);
+			if (err < 0) {
+				tls_err_abort(tsk);
+				goto recv_end;
+			}
+			tls_rx_msg(skb)->decrypted = 1;
+			if (!pskb_pull(skb, rxm->offset)) {
+				goto recv_end;
+			}
+			if ((err = pskb_trim(skb, rxm->full_len))) {
+				goto recv_end;
+			}
+		}
+
+		used = recv_actor(desc, skb, 0, rxm->full_len);
+		copied += used;
+		tsk->recv_len -= used;
+
+		if (used < rxm->full_len) {
+			rxm->full_len -= used;
+			rxm->offset += used;
+			break;
+		} else {
+			skb_unlink(skb, &tsk->sk.sk_receive_queue);
+			kfree_skb(skb);
+		}
+		tls_dequeue_held_data(tsk);
+		if (!desc->count)
+			break;
+	}
+
+recv_end:
+
+	return copied;
+}
+
 static int tls_recvmsg(struct socket *sock,
 		       struct msghdr *msg,
 		       size_t len,
@@ -1487,6 +1544,7 @@ static int tls_recvmsg(struct socket *sock,
 		copied += chunk;
 		len -= chunk;
 		if (likely(!(flags & MSG_PEEK))) {
+			tsk->recv_len -= chunk;
 			if (chunk < rxm->full_len) {
 				rxm->offset += chunk;
 				rxm->full_len -= chunk;
@@ -1541,6 +1599,7 @@ static int dtls_recvmsg(struct socket *sock,
 	if (err < 0)
 		goto recv_end;
 	copied = rxm->full_len;
+	tsk->recv_len -= rxm->full_len;
 	if (copied > len)
 		msg->msg_flags |= MSG_TRUNC;
 	if (likely(!(flags & MSG_PEEK))) {
@@ -1616,6 +1675,7 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 
 	rxm->offset += copied;
 	rxm->full_len -= copied;
+	tsk->recv_len -= copied;
 
 splice_read_end:
 	release_sock(sk);
@@ -1850,6 +1910,8 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	tsk->socket->sk->sk_user_data = tsk;
 	write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
 
+	sock->sk->sk_protocol = tsk->socket->sk->sk_protocol;
+
 	release_sock(sock->sk);
 	/* Check if any TLS packets have come in between the time the
 	 * handshake was completed and bind() was called. If there
@@ -1868,6 +1930,16 @@ out:
 	release_sock(sock->sk);
 	return ret;
 }
+
+static int tls_peek_len(struct socket *sock)
+{
+	struct tls_sock *tsk;
+
+	tsk = tls_sk(sock->sk);
+
+	return tsk->recv_len;
+}
+
 
 static int tls_release(struct socket *sock)
 {
@@ -1903,6 +1975,8 @@ static const struct proto_ops tls_stream_ops = {
 	.sendpage	=	tls_sendpage,
 	.release	=	tls_release,
 	.splice_read    =	tls_splice_read,
+	.read_sock      =       tls_read_sock,
+	.peek_len       =       tls_peek_len,
 };
 
 static const struct proto_ops tls_dgram_ops = {
@@ -1927,6 +2001,8 @@ static const struct proto_ops tls_dgram_ops = {
 	.sendpage	=	tls_sendpage,
 	.release	=	tls_release,
 	.splice_read    =	tls_splice_read,
+	.read_sock      =       tls_read_sock,
+	.peek_len       =       tls_peek_len,
 };
 
 static void tls_sock_destruct(struct sock *sk)
@@ -2026,6 +2102,7 @@ static int tls_create(struct net *net,
 
 	tsk->pages_send = NULL;
 	tsk->unsent = 0;
+	tsk->recv_len = 0;
 
 	ret = -ENOMEM;
 	/* Preallocation for sending
