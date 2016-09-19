@@ -50,11 +50,7 @@
 /* +1 for aad, +1 for tag, +1 for chaining */
 #define KTLS_SG_DATA_SIZE		(KTLS_DATA_PAGES + 3)
 
-/* RFC5288 patch requires 24 bytes allocated
- */
-#define KTLS_AAD_SPACE_SIZE		24
-/* RFC52888: AAD is zero-padded to 21 */
-#define KTLS_PADDED_AAD_SIZE		21
+#define KTLS_AAD_SPACE_SIZE		21
 #define KTLS_AAD_SIZE			13
 
 /* TLS
@@ -994,9 +990,6 @@ static inline void tls_make_aad(struct tls_sock *tsk,
 				size_t size,
 				char *nonce_explicit)
 {
-	/* has to be zero padded according to RFC5288 */
-	memset(buf, 0, KTLS_AAD_SPACE_SIZE);
-
 	memcpy(buf, nonce_explicit, KTLS_NONCE_SIZE);
 
 	buf[8] = KTLS_RECORD_DATA;
@@ -1020,7 +1013,7 @@ static int tls_do_encryption(struct tls_sock *tsk,
 		return -ENOMEM;
 
 	aead_request_set_tfm(aead_req, tsk->aead_send);
-	aead_request_set_ad(aead_req, KTLS_PADDED_AAD_SIZE);
+	aead_request_set_ad(aead_req, KTLS_AAD_SPACE_SIZE);
 	aead_request_set_crypt(aead_req, sgin, sgout, data_len, tsk->iv_send);
 	aead_request_set_callback(aead_req, 0, NULL, NULL);
 
@@ -1292,7 +1285,7 @@ static int tls_do_decryption(struct tls_sock *tsk,
 		return -ENOMEM;
 
 	aead_request_set_tfm(aead_req, tsk->aead_recv);
-	aead_request_set_ad(aead_req, KTLS_PADDED_AAD_SIZE);
+	aead_request_set_ad(aead_req, KTLS_AAD_SPACE_SIZE);
 	aead_request_set_crypt(aead_req, sgin, sgout,
 			       data_len + KTLS_TAG_SIZE,
 			       (u8 *)header_recv + KTLS_NONCE_OFFSET(tsk));
