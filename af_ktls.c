@@ -190,6 +190,7 @@ struct tls_sock {
 	struct work_struct recv_work;
 	void (*saved_sk_data_ready)(struct sock *sk);
 	void (*saved_sk_write_space)(struct sock *sk);
+	size_t recv_len;
 
 	/* our cipher type and its crypto API representation (e.g. "gcm(aes)")
 	 */
@@ -268,6 +269,8 @@ static void increment_seqno(unsigned char *seq, struct tls_sock *tsk)
 static void tls_unattach(struct tls_sock *tsk)
 {
 	write_lock_bh(&tsk->socket->sk->sk_callback_lock);
+	tsk->rx_stopped = 1;
+	strp_stop(&tsk->strp);
 	tsk->socket->sk->sk_data_ready = tsk->saved_sk_data_ready;
 	tsk->socket->sk->sk_write_space = tsk->saved_sk_write_space;
 	tsk->socket->sk->sk_user_data = NULL;
@@ -290,7 +293,8 @@ static void tls_abort_cb(struct strparser *strp, int err)
 	struct tls_sock *tsk;
 
 	tsk = strp->sk->sk_user_data;
-	tls_err_abort(tsk);
+	if (tsk)
+		tls_err_abort(tsk);
 }
 
 static int decrypt_skb(struct tls_sock *tsk, struct sk_buff *skb)
@@ -316,12 +320,6 @@ static int decrypt_skb(struct tls_sock *tsk, struct sk_buff *skb)
 	sg_init_table(tsk->sgin, ARRAY_SIZE(tsk->sgin));
 	sg_set_buf(&tsk->sgin[0], tsk->aad_recv, sizeof(tsk->aad_recv));
 
-	/* TODO: So what exactly happens if skb_to_sgvec causes more
-	 * than ALG_MAX_PAGES fragments? Consider allocating kernel
-	 * pages tls_read_size already copied headers and
-	 * aad. Therefore this simply needs to pass the encrypted data
-	 * + message
-	 */
 	nsg = skb_to_sgvec(skb, &tsk->sgin[1], rxm->offset +
 			prepend,
 			rxm->full_len - prepend);
@@ -449,7 +447,10 @@ static int tls_parse_cb(struct strparser *strp, struct sk_buff *skb)
 
 	tsk = strp->sk->sk_user_data;
 
-	return tls_read_size(tsk, skb);
+	if (tsk)
+		return tls_read_size(tsk, skb);
+	else
+		return -1;
 }
 
 static void tls_queue(struct strparser *strp, struct sk_buff *skb)
@@ -461,7 +462,15 @@ static void tls_queue(struct strparser *strp, struct sk_buff *skb)
 	rxm = strp_rx_msg(skb);
 	tsk = strp->sk->sk_user_data;
 
+	if (!tsk || tsk->rx_stopped) {
+		kfree_skb(skb);
+		return;
+	}
+
 	tls_rx_msg(skb)->decrypted = 0;
+	bh_lock_sock(&tsk->sk);
+
+	tsk->recv_len += rxm->full_len - KTLS_OVERHEAD(tsk);
 
 	ret = sock_queue_rcv_skb((struct sock *)tsk, skb);
 	if (ret < 0) {
@@ -470,7 +479,9 @@ static void tls_queue(struct strparser *strp, struct sk_buff *skb)
 		 */
 		skb_queue_tail(&tsk->rx_hold_queue, skb);
 		strp->rx_paused = 1;
+		tsk->sk.sk_data_ready(&tsk->sk);
 	}
+	bh_unlock_sock(&tsk->sk);
 }
 
 /* Called with lower socket held */
@@ -485,7 +496,7 @@ static void tls_data_ready(struct sock *sk)
 		goto out;
 
 	if (IS_TLS(tsk))
-		strp_tcp_data_ready(&tsk->strp);
+		strp_data_ready(&tsk->strp);
 	else
 		queue_work(tls_rx_wq, &tsk->recv_work);
 
@@ -1004,7 +1015,7 @@ static int tls_do_encryption(struct tls_sock *tsk,
 	unsigned int req_size = sizeof(struct aead_request) +
 		crypto_aead_reqsize(tsk->aead_recv);
 	struct aead_request *aead_req = (void *)sock_kmalloc(&tsk->sk, req_size,
-							GFP_KERNEL);
+							GFP_ATOMIC);
 	if (!aead_req)
 		return -ENOMEM;
 
@@ -1033,7 +1044,7 @@ static int tls_pre_encrypt(struct tls_sock *tsk, size_t data_len)
 	struct scatterlist *sg;
 	int ret = 0;
 
-	encrypt_len = data_len + KTLS_TAG_SIZE;
+	encrypt_len = data_len + KTLS_OVERHEAD(tsk);
 	npages = encrypt_len / PAGE_SIZE;
 	aligned_size = npages * PAGE_SIZE;
 	if (aligned_size < encrypt_len)
@@ -1170,13 +1181,12 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 		if (sk->sk_err)
 			goto send_end;
 
+		if (!sk_stream_memory_free(sk))
+			goto wait_for_memory;
+
 		skb = tcp_write_queue_tail(sk);
 
 		while (!skb) {
-			ret = sk_stream_wait_memory(sk, &timeo);
-			if (ret)
-				goto send_end;
-
 			skb = alloc_skb(0, sk->sk_allocation);
 			if (skb)
 				__skb_queue_tail(&sk->sk_write_queue, skb);
@@ -1246,6 +1256,7 @@ static int tls_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 
 wait_for_memory:
 		tls_push(tsk);
+		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
 		ret = sk_stream_wait_memory(sk, &timeo);
 		if (ret)
 			goto send_end;
@@ -1276,7 +1287,7 @@ static int tls_do_decryption(struct tls_sock *tsk,
 	unsigned int req_size = sizeof(struct aead_request) +
 		crypto_aead_reqsize(tsk->aead_recv);
 	struct aead_request *aead_req = (void *)sock_kmalloc(&tsk->sk, req_size,
-							GFP_KERNEL);
+							GFP_ATOMIC);
 	if (!aead_req)
 		return -ENOMEM;
 
@@ -1375,7 +1386,7 @@ static void tls_dequeue_held_data(struct tls_sock *tsk)
 		int unpause = 1;
 		struct sk_buff *skb;
 
-		while ((skb = __skb_dequeue(&tsk->rx_hold_queue))) {
+		while ((skb = skb_dequeue(&tsk->rx_hold_queue))) {
 			int ret = sock_queue_rcv_skb((struct sock *)tsk, skb);
 
 			if (ret < 0) {
@@ -1429,6 +1440,60 @@ static struct sk_buff *tls_wait_data(struct tls_sock *tsk, int flags,
 	return skb;
 }
 
+
+static int tls_read_sock(struct sock *sk, read_descriptor_t *desc,
+			sk_read_actor_t recv_actor) {
+	struct strp_rx_msg *rxm;
+	struct sk_buff *skb;
+	struct tls_sock *tsk;
+	int err;
+	int used;
+	int copied = 0;
+
+	tsk = tls_sk(sk);
+
+	tls_dequeue_held_data(tsk);
+
+	while((skb = skb_peek(&sk->sk_receive_queue)) != NULL) {
+		rxm = strp_rx_msg(skb);
+
+		if (!tls_rx_msg(skb)->decrypted) {
+			err = decrypt_skb(tsk, skb);
+			if (err < 0) {
+				tls_err_abort(tsk);
+				goto recv_end;
+			}
+			tls_rx_msg(skb)->decrypted = 1;
+			if (!pskb_pull(skb, rxm->offset)) {
+				goto recv_end;
+			}
+			if ((err = pskb_trim(skb, rxm->full_len))) {
+				goto recv_end;
+			}
+		}
+
+		used = recv_actor(desc, skb, 0, rxm->full_len);
+		copied += used;
+		tsk->recv_len -= used;
+
+		if (used < rxm->full_len) {
+			rxm->full_len -= used;
+			rxm->offset += used;
+			break;
+		} else {
+			skb_unlink(skb, &tsk->sk.sk_receive_queue);
+			kfree_skb(skb);
+		}
+		tls_dequeue_held_data(tsk);
+		if (!desc->count)
+			break;
+	}
+
+recv_end:
+
+	return copied;
+}
+
 static int tls_recvmsg(struct socket *sock,
 		       struct msghdr *msg,
 		       size_t len,
@@ -1479,9 +1544,10 @@ static int tls_recvmsg(struct socket *sock,
 		copied += chunk;
 		len -= chunk;
 		if (likely(!(flags & MSG_PEEK))) {
-			if (copied < rxm->full_len) {
-				rxm->offset += copied;
-				rxm->full_len -= copied;
+			tsk->recv_len -= chunk;
+			if (chunk < rxm->full_len) {
+				rxm->offset += chunk;
+				rxm->full_len -= chunk;
 			} else {
 				/* Finished with message */
 				skb_unlink(skb, &((struct sock *)tsk)
@@ -1533,6 +1599,7 @@ static int dtls_recvmsg(struct socket *sock,
 	if (err < 0)
 		goto recv_end;
 	copied = rxm->full_len;
+	tsk->recv_len -= rxm->full_len;
 	if (copied > len)
 		msg->msg_flags |= MSG_TRUNC;
 	if (likely(!(flags & MSG_PEEK))) {
@@ -1608,6 +1675,7 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 
 	rxm->offset += copied;
 	rxm->full_len -= copied;
+	tsk->recv_len -= copied;
 
 splice_read_end:
 	release_sock(sk);
@@ -1647,7 +1715,7 @@ static ssize_t tls_sendpage(struct socket *sock, struct page *page,
 	sk_clear_bit(SOCKWQ_ASYNC_NOSPACE, sk);
 
 	/* Call the sk_stream functions to manage the sndbuf mem. */
-	while (queued < size) {
+	while (size > 0) {
 		size_t send_size = min(size, KTLS_MAX_PAYLOAD_SIZE);
 
 		if (!sk_stream_memory_free(sk) ||
@@ -1687,6 +1755,8 @@ static ssize_t tls_sendpage(struct socket *sock, struct page *page,
 					ret = sk_stream_wait_memory(sk, &timeo);
 					if (ret)
 						goto sendpage_end;
+
+					tskb = alloc_skb(0, sk->sk_allocation);
 				}
 
 				if (skb)
@@ -1714,12 +1784,17 @@ coalesced:
 		sk->sk_wmem_queued += send_size;
 		sk_mem_charge(sk, send_size);
 		tsk->unsent += send_size;
+		queued += send_size;
+		offset += queued;
+		size -= send_size;
 
 		if (eor || tsk->unsent >= KTLS_MAX_PAYLOAD_SIZE)
 			tls_push(tsk);
-		queued += send_size;
 	}
 sendpage_end:
+	if (eor || tsk->unsent >= KTLS_MAX_PAYLOAD_SIZE)
+		tls_push(tsk);
+
 	ret = sk_stream_error(sk, flags, ret);
 
 	if (ret < 0)
@@ -1731,7 +1806,7 @@ sendpage_end:
 
 	release_sock(sk);
 
-	return ret < 0 ? ret : size;
+	return ret < 0 ? ret : queued;
 }
 
 static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
@@ -1784,7 +1859,7 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	tsk->socket = sockfd_lookup(sa_ktls->sa_socket, &ret);
 	if (!tsk->socket) {
 		ret = -ENOENT;
-		goto bind_end;
+		goto out;
 	}
 	if (!IS_TCP(tsk->socket) && !IS_UDP(tsk->socket)) {
 		ret = -EAFNOSUPPORT;
@@ -1835,6 +1910,8 @@ static int tls_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	tsk->socket->sk->sk_user_data = tsk;
 	write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
 
+	sock->sk->sk_protocol = tsk->socket->sk->sk_protocol;
+
 	release_sock(sock->sk);
 	/* Check if any TLS packets have come in between the time the
 	 * handshake was completed and bind() was called. If there
@@ -1853,6 +1930,16 @@ out:
 	release_sock(sock->sk);
 	return ret;
 }
+
+static int tls_peek_len(struct socket *sock)
+{
+	struct tls_sock *tsk;
+
+	tsk = tls_sk(sock->sk);
+
+	return tsk->recv_len;
+}
+
 
 static int tls_release(struct socket *sock)
 {
@@ -1888,6 +1975,8 @@ static const struct proto_ops tls_stream_ops = {
 	.sendpage	=	tls_sendpage,
 	.release	=	tls_release,
 	.splice_read    =	tls_splice_read,
+	.read_sock      =       tls_read_sock,
+	.peek_len       =       tls_peek_len,
 };
 
 static const struct proto_ops tls_dgram_ops = {
@@ -1912,6 +2001,8 @@ static const struct proto_ops tls_dgram_ops = {
 	.sendpage	=	tls_sendpage,
 	.release	=	tls_release,
 	.splice_read    =	tls_splice_read,
+	.read_sock      =       tls_read_sock,
+	.peek_len       =       tls_peek_len,
 };
 
 static void tls_sock_destruct(struct sock *sk)
@@ -1920,24 +2011,25 @@ static void tls_sock_destruct(struct sock *sk)
 
 	tsk = tls_sk(sk);
 
-	cancel_work_sync(&tsk->recv_work);
-	cancel_work_sync(&tsk->send_work);
-
-	skb_queue_purge(&tsk->rx_hold_queue);
-
 	/* restore callback and abandon socket */
 	if (tsk->socket) {
 		write_lock_bh(&tsk->socket->sk->sk_callback_lock);
 
 		tsk->rx_stopped = 1;
+		strp_stop(&tsk->strp);
 		tsk->socket->sk->sk_data_ready = tsk->saved_sk_data_ready;
 		tsk->socket->sk->sk_write_space = tsk->saved_sk_write_space;
 		tsk->socket->sk->sk_user_data = NULL;
 		write_unlock_bh(&tsk->socket->sk->sk_callback_lock);
 
+		strp_done(&tsk->strp);
+
 		sockfd_put(tsk->socket);
 		tsk->socket = NULL;
 	}
+
+	cancel_work_sync(&tsk->recv_work);
+	cancel_work_sync(&tsk->send_work);
 
 	kfree(tsk->iv_send);
 
@@ -1951,6 +2043,7 @@ static void tls_sock_destruct(struct sock *sk)
 
 	crypto_free_aead(tsk->aead_recv);
 
+	skb_queue_purge(&tsk->rx_hold_queue);
 	skb_queue_purge(&sk->sk_receive_queue);
 }
 
@@ -2009,6 +2102,7 @@ static int tls_create(struct net *net,
 
 	tsk->pages_send = NULL;
 	tsk->unsent = 0;
+	tsk->recv_len = 0;
 
 	ret = -ENOMEM;
 	/* Preallocation for sending
