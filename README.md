@@ -23,3 +23,32 @@ enhancements or bugs.
 
 See also [AF_KTLS tool](https://github.com/fridex/af_ktls-tool), [AF_KTLS
 visualize](https://github.com/fridex/af_ktls-visualize).
+
+
+## Conference Talks
+
+###  Fridolín Pokorný -  AF\_KTLS - TLS/DTLS Linux kernel module
+
+Feb 5th 2017, Brussels, Belgium: FOSDEM 
+
+ * [talk info](https://fosdem.org/2017/schedule/event/af_ktls/)
+ * [slides](https://fosdem.org/2017/schedule/event/af_ktls/attachments/slides/1767/export/events/attachments/af_ktls/slides/1767/slides.)
+ * [video](https://www.youtube.com/watch?v=CtxLPqqbiq0)
+
+###  Fridolín Pokorný -  AF\_KTLS - TLS/DTLS Linux kernel module
+
+Jan 21nd 2017, Brno, Czech republic: Devconf.cz 
+
+ * [info](https://devconf.cz/)
+ * [slides](https://fosdem.org/2017/schedule/event/af_ktls/attachments/slides/1767/export/events/attachments/af_ktls/slides/1767/slides.)
+ * [video](https://www.youtube.com/watch?v=JkfvnRiVP50&t=5m50s)
+
+###  Dave Watson - Kernel TLS (Transport Layer Security) Socket
+
+Oct 5th 2016, Tokyo, Japan: Netdev 1.2
+
+ * [talk info](http://netdevconf.org/1.2/session.html?dave-watson)
+ * [slides](http://netdevconf.org/1.2/slides/oct5/05_davejwatson_tls_netdev12.pdf)
+ * [video](https://www.youtube.com/watch?v=LbZu0D05Wko)
+ * [paper](http://netdevconf.org/1.2/papers/ktls.pdf)
+
