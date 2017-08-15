@@ -816,6 +816,9 @@ static int tls_setsockopt(struct socket *sock,
 	case KTLS_SET_SALT_SEND:
 		ret = tls_set_salt(sock, 0, optval, optlen);
 		break;
+	case KTLS_SET_MTU:
+		ret = 0;
+		break;
 	case KTLS_UNATTACH:
 		tls_do_unattach(sock);
 		ret = 0;
@@ -1662,7 +1665,7 @@ static ssize_t tls_splice_read(struct socket *sock,  loff_t *ppos,
 	}
 	chunk = min_t(unsigned int, rxm->full_len, len);
 	copied = skb_splice_bits(skb, sk, rxm->offset, pipe, chunk,
-				 flags, tls_sock_splice);
+				 flags);
 	if (ret < 0)
 		goto splice_read_end;
 
