@@ -816,6 +816,9 @@ static int tls_setsockopt(struct socket *sock,
 	case KTLS_SET_SALT_SEND:
 		ret = tls_set_salt(sock, 0, optval, optlen);
 		break;
+	case KTLS_SET_MTU:
+		ret = 0;
+		break;
 	case KTLS_UNATTACH:
 		tls_do_unattach(sock);
 		ret = 0;
