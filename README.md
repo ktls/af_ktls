@@ -1,6 +1,6 @@
 # Linux Kernel TLS/DTLS Socket
 
-*Note that the implementation is under heavy development. Use on your own risk!*
+*Note: This repository is no longer maintained. This kernel module—particularly its TLS part (not DTLS)—has been merged into the Linux mainline and is available since Linux 4.13 as [Kernel TLS socket](https://www.kernel.org/doc/html/latest/networking/tls.html).*
 
 This kernel module introduces an ```AF_KTLS``` socket. ```AF_KTLS``` socket can
 be used to transmit data over TLS 1.2 using TCP or DTLS 1.2 using UDP.
